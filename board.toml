@@ -1,0 +1,12 @@
+[board]
+name = "tb375fc"
+vendor = "Lenovo"
+model = "Xiaoxin Pad Pro 12.7 (2025)"
+product = "P98300DA2"
+soc = "mt6897"
+arch = "arm64e"
+ram_gb = 8
+display_width = 2944
+display_height = 1840
+display_refresh_hz = 120
+target_os = "macos-27.3-26C5035r"

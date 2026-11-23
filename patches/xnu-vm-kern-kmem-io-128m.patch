@@ -1,0 +1,11 @@
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3050,7 +3050,7 @@
+ 	kmem_claims[kmem_claim_count++] = (struct kmem_range_startup_spec){
+ 		.kc_name  = "kmem_io",
+ 		.kc_range = kmem_range(KMEM_RANGE_ID_IO),
+-		.kc_size  = (1u << 30),
++		.kc_size  = (128u << 20), /* TB375FC: reclaim 896 MiB kernel VA for kmem_data_shared_range */
+ 		.kc_flags = KC_NO_ENTRY,
+ 	};
+ 

@@ -1,0 +1,23 @@
+# UniXNU strict exclusion of proprietary blobs, Apple IPSW, firmware, and build outputs
+*.img
+*.dmg
+*.ipsw
+*.aea
+*.macho
+*.lzma
+*.dbr
+*.raw
+*.bin
+*.efi
+*.o
+*.a
+*.dylib
+*.ko
+*.log
+*.dSYM/
+__pycache__/
+.DS_Store
+.cache/
+out/
+build/
+work-*/
