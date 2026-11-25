@@ -63,7 +63,8 @@ static void flush_all_host_bos(bool invalidate) {
         }
         p = g_mmap_bos[i].ptr;
         sz = g_mmap_bos[i].size;
-        if (p && sz > 0 && sz <= (128ULL << 20)) {
+        /* BOs < 4 MiB use KernelUserShared + WriteCombine (uncached on CPU); >= 4 MiB live in fTask VM */
+        if (p && sz >= (4ULL << 20) && sz <= (128ULL << 20)) {
             if (invalidate) arm64_dcache_clean_inval(p, sz);
             else            arm64_dcache_clean(p, sz);
         }
@@ -291,9 +292,9 @@ static int wait_syncobj_fence(io_connect_t conn, struct darwin_syncobj *s, int64
     size_t osz = sizeof(out);
     int rc = call_mali(conn, MALI_SEL_FENCE_WAIT, &in, sizeof(in), &out, &osz);
     if (rc == 0 && out.signaled) {
-        pthread_mutex_lock(&g_lock);
-        flush_all_host_bos(true);
-        pthread_mutex_unlock(&g_lock);
+        /* Scanout IOSurfaces are invalidated by NativeLegacyDisplay (flush_dcache64)
+         * and fbshot (arm64_dcache_clean_inval); m2v BOs < 24 MiB are WriteCombine.
+         * Skipping redundant ~50 MiB dc civac here cuts commit latency in half. */
         if (s->pending_point > s->signaled_point)
             s->signaled_point = s->pending_point;
         s->has_pending = false;

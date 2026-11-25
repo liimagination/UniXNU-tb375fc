@@ -82,7 +82,7 @@ def lzma_alone(raw: bytes, dict_size: int, nice_len: int = 273) -> bytes:
     return packed
 
 
-def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False, persist_storage: bool = False) -> Path:
+def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False, persist_storage: bool = False, mali_driver: bool = False) -> Path:
     kout = output / 'kernel-out'
     kout.mkdir(parents=True, exist_ok=True)
     diag = kout / 'xnu-cdc-board-diag.macho'
@@ -372,8 +372,11 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
     ]
     if touch_stage1:
         touch_dir = BASE / 'touch-prep'
+        mali4_touch = TIER3_KDIR / 'mali-bringup/libTb375fcTouch_mali4.a'
         fixed_touch = TIER3_KDIR / 'touch-fix/libTb375fcTouch_fixed.a'
-        if fixed_touch.is_file():
+        if mali_driver and mali4_touch.is_file():
+            touch_archive = mali4_touch
+        elif fixed_touch.is_file():
             touch_archive = fixed_touch
         else:
             touch_archive = touch_dir / 'build/libTb375fcTouch.a'
@@ -524,8 +527,14 @@ def main():
                         help='integrate Tb375fcTouch and pass touch=N (1=snapshot, 2=spi2 init, 3=trim ID, 4=HID)')
     parser.add_argument('--persist-storage', action='store_true',
                         help='link isolated bounded UFS LUN2 PersistOverlay storage archive (boot-arg gated via data-persist=1|2)')
+    parser.add_argument('--mali-driver', action='store_true',
+                        help='link Tb375fcMaliDriver IOUserClient (libTb375fcTouch_mali4.a) for mali=4')
+    parser.add_argument('--panvk-icd', type=Path, default=None,
+                        help='pack Mesa panvk libvulkan_panfrost.dylib instead of SwiftShader')
     parser.add_argument('--extra-boot-arg', action='append', default=[],
                         help='additional XNU boot-arg (repeatable)')
+    parser.add_argument('--het-clusters', action='store_true',
+                        help='tag ADT cpu0..3 as E-cluster (A510) and cpu4..7 as P-cluster (A715)')
     args = parser.parse_args()
     if args.menu_timeout is not None and args.menu_timeout < 1:
         parser.error('--menu-timeout must leave time to enter the menu')
@@ -540,7 +549,7 @@ def main():
             parser.error('--touch-stage supplies its own touch=N boot argument')
         args.extra_boot_arg.append(f'touch={touch_stage}')
     output.mkdir(parents=True, exist_ok=True)
-    diag_kernel = build_kernel(output, args.rebuild_display, touch_stage > 0, persist_storage=args.persist_storage)
+    diag_kernel = build_kernel(output, args.rebuild_display, touch_stage > 0, persist_storage=args.persist_storage, mali_driver=args.mali_driver)
     if args.lazy_code_hashes:
         symbols = subprocess.check_output(['xcrun', 'nm', str(diag_kernel)], text=True)
         for name in ('_cs_native4k_lazy', '_cs_native4k_lazy_authenticate'):
@@ -597,11 +606,19 @@ def main():
                 ('sbin/tb375fc-gpu-daemon', 0o755, active_daemon.read_bytes()),
             ]
         else:
-            addon_entries = [
-                ('sbin/BootCacheControl', 0o755, launcher.read_bytes()),
-                ('sbin/tb375fc-gpu-daemon', 0o755, active_daemon.read_bytes()),
-                ('lib/libvk_swiftshader.dylib', 0o755, swiftshader.read_bytes()),
-            ]
+            if args.panvk_icd and args.panvk_icd.is_file():
+                print(f"[build] Vulkan ICD: Mesa panvk ({args.panvk_icd.name})")
+                addon_entries = [
+                    ('sbin/BootCacheControl', 0o755, launcher.read_bytes()),
+                    ('sbin/tb375fc-gpu-daemon', 0o755, active_daemon.read_bytes()),
+                    ('lib/libvulkan_panfrost.dylib', 0o755, args.panvk_icd.read_bytes()),
+                ]
+            else:
+                addon_entries = [
+                    ('sbin/BootCacheControl', 0o755, launcher.read_bytes()),
+                    ('sbin/tb375fc-gpu-daemon', 0o755, active_daemon.read_bytes()),
+                    ('lib/libvk_swiftshader.dylib', 0o755, swiftshader.read_bytes()),
+                ]
             for path in sorted(bundle.rglob('*')):
                 if not path.is_file():
                     continue
@@ -624,7 +641,9 @@ def main():
         trust_hashes = [daemon_hash]
         if launcher == custom_launcher:
             trust_hashes.append(signed_cdhash(launcher))
-        if not cpu_only and swiftshader == custom_ss:
+        if not cpu_only and args.panvk_icd and args.panvk_icd.is_file():
+            trust_hashes.append(signed_cdhash(args.panvk_icd))
+        elif not cpu_only and swiftshader == custom_ss:
             trust_hashes.append(signed_cdhash(swiftshader))
         subprocess.run([
             sys.executable,
@@ -646,6 +665,19 @@ def main():
         d_props.append(('vmm-present', struct.pack('<I', 1)))
         d_props.append(('sleep-disabled', struct.pack('<I', 1)))
         tree[1][d_idx] = (d_props, tree[1][d_idx][1])
+        if args.het_clusters:
+            c_idx = next(i for i, c in enumerate(tree[1]) if dict(c[0]).get('name', b'').rstrip(b'\0') == b'cpus')
+            new_cpus = []
+            for child in tree[1][c_idx][1]:
+                cname = dict(child[0]).get('name', b'').rstrip(b'\0').decode()
+                cprops = [(k, v) for k, v in child[0] if k != 'cluster-type']
+                if cname in ('cpu0', 'cpu1', 'cpu2', 'cpu3'):
+                    cprops.append(('cluster-type', struct.pack('<I', ord('E'))))
+                elif cname in ('cpu4', 'cpu5', 'cpu6', 'cpu7'):
+                    cprops.append(('cluster-type', struct.pack('<I', ord('P'))))
+                new_cpus.append((cprops, child[1]))
+            tree[1][c_idx] = (tree[1][c_idx][0], new_cpus)
+            print('      ADT heterogeneous clusters enabled: cpu0..3=E (A510), cpu4..7=P (A715)', flush=True)
         dt_bytes = adt_helpers.encode(tree)
         # Re-validate ADT with DarwinBoot validator
         import ctypes

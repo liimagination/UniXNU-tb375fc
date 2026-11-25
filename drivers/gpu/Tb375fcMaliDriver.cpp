@@ -82,8 +82,11 @@ constexpr uint32_t GF_REG_MAGIC        = 0x0000u;
 constexpr uint32_t GF_REG_GPU_OPP_NUM  = 0x000Cu;
 constexpr uint32_t GF_REG_POWER_COUNT  = 0x001Cu;
 constexpr uint32_t GF_REG_FREQ_CUR_GPU = 0x0044u;
-constexpr uint32_t CMD_INIT_SHARED_MEM = 0u;
-constexpr uint32_t CMD_POWER_CONTROL   = 6u;
+constexpr uint32_t CMD_INIT_SHARED_MEM      = 0u;
+constexpr uint32_t CMD_GET_FREQ_BY_IDX      = 1u;
+constexpr uint32_t CMD_POWER_CONTROL        = 6u;
+constexpr uint32_t CMD_ACTIVE_SLEEP_CONTROL = 7u;
+constexpr uint32_t CMD_COMMIT               = 8u;
 
 /* Mali-G615 GPU control registers */
 constexpr uint32_t GPU_ID_REG             = 0x0000u;
@@ -172,6 +175,11 @@ static bool mapMmio(uint64_t phys, uint64_t size, MappedPage *out) {
     if (!out->map) { out->desc->release(); out->desc = nullptr; return false; }
     out->va = static_cast<uintptr_t>(out->map->getVirtualAddress());
     return out->va != 0;
+}
+static void unmapMmio(MappedPage *p) {
+    if (p->map)  { p->map->release();  p->map  = nullptr; }
+    if (p->desc) { p->desc->release(); p->desc = nullptr; }
+    p->va = 0;
 }
 
 static inline uint32_t rd32(uintptr_t base, uint32_t off) {
@@ -691,6 +699,136 @@ static bool initMaliHardware(void) {
         return false;
     }
 
+    /* Read-only GPU & CPU clock telemetry + OPP boost (MT6897) */
+    {
+        uint32_t gpuFreq = rd32(gMali.gpuebDram.va, GF_REG_FREQ_CUR_GPU);
+        uint32_t gpuOppN = rd32(gMali.gpuebDram.va, GF_REG_GPU_OPP_NUM);
+        IOLog("Tb375fcMali: GPUEB initial cur_gpu_freq=%u kHz opp_num=%u\n", gpuFreq, gpuOppN);
+
+        uint32_t boostEn = 1u;
+        PE_parse_boot_argn("boost", &boostEn, sizeof(boostEn));
+
+        /* 1. GPU OPP boost via GPUEB CMD_GET_FREQ_BY_IDX + CMD_COMMIT (target ~850 MHz) */
+        if (boostEn && gpuOppN > 0 && gpuOppN <= 128) {
+            uint32_t bestIdx = gpuOppN / 2u;
+            uint32_t bestDiff = 0xFFFFFFFFu;
+            uint32_t bestFreq = 0u;
+            uint32_t f0 = 0u, fMid = 0u, fEnd = 0u;
+            for (uint32_t idx = 0; idx < gpuOppN; ++idx) {
+                memset(&tx, 0, sizeof(tx));
+                memset(&rx, 0, sizeof(rx));
+                tx.magic = ipiMagic;
+                tx.cmd   = CMD_GET_FREQ_BY_IDX;
+                tx.target = 0u;
+                tx.u.raw[0] = idx;
+                if (gpuebSendGfIpi(mboxVa, gMali.gpuebMbox.va, tx, &rx) == 0) {
+                    uint32_t fk = static_cast<uint32_t>(rx.u.return_value);
+                    if (idx == 0) f0 = fk;
+                    if (idx == gpuOppN / 2u) fMid = fk;
+                    if (idx == gpuOppN - 1u) fEnd = fk;
+                    if (fk >= 200000u && fk <= 1500000u) {
+                        uint32_t diff = (fk > 850000u) ? (fk - 850000u) : (850000u - fk);
+                        if (diff < bestDiff) { bestDiff = diff; bestIdx = idx; bestFreq = fk; }
+                    }
+                }
+            }
+            IOLog("Tb375fcMali: GPUEB OPP table[0]=%u mid=%u end=%u -> picking idx=%u (%u kHz)\n",
+                  f0, fMid, fEnd, bestIdx, bestFreq);
+            if (bestFreq > 0u) {
+                memset(&tx, 0, sizeof(tx));
+                memset(&rx, 0, sizeof(rx));
+                tx.magic = ipiMagic;
+                tx.cmd   = CMD_ACTIVE_SLEEP_CONTROL;
+                tx.u.power_state = 1u; /* POWER_ACTIVE */
+                int arc = gpuebSendGfIpi(mboxVa, gMali.gpuebMbox.va, tx, &rx);
+                IOLog("Tb375fcMali: GPUEB ACTIVE_SLEEP(1) rc=%d ret=%d\n", arc, rx.u.return_value);
+
+                for (uint32_t tgt = 0u; tgt <= 1u; ++tgt) {
+                    memset(&tx, 0, sizeof(tx));
+                    memset(&rx, 0, sizeof(rx));
+                    tx.magic = ipiMagic;
+                    tx.cmd   = CMD_COMMIT;
+                    tx.target = tgt;
+                    tx.u.raw[0] = bestIdx;
+                    int crc = gpuebSendGfIpi(mboxVa, gMali.gpuebMbox.va, tx, &rx);
+                    IOSleep(2);
+                    uint32_t newGpuFreq = rd32(gMali.gpuebDram.va, GF_REG_FREQ_CUR_GPU);
+                    IOLog("Tb375fcMali: GPUEB CMD_COMMIT(tgt=%u idx=%u) rc=%d ret=%d -> cur_gpu_freq=%u kHz opp=%u\n",
+                          tgt, bestIdx, crc, rx.u.return_value, newGpuFreq, rd32(gMali.gpuebDram.va, 0x04u));
+                    if (newGpuFreq >= 200000u) break;
+                }
+            }
+        }
+
+        /* 2. CPU Hardware DVFS boost via mediatek,cpufreq-hw (0x11bc10, 0x11bd30, 0x11be50) */
+        MappedPage pllMap = {}, csramMap = {};
+        auto logPll = [&](const char *tag) {
+            if (!pllMap.va) return;
+            static const uint32_t offs[4] = {0x00cu, 0x40cu, 0x80cu, 0xc0cu};
+            uint32_t raw[4] = {}, mhz[4] = {};
+            for (int i = 0; i < 4; ++i) {
+                raw[i] = rd32(pllMap.va, offs[i]);
+                uint32_t pcw = raw[i] & 0x3fffffu;
+                uint32_t posdiv = (raw[i] >> 24) & 0x7u;
+                mhz[i] = (uint32_t)((26ULL * pcw) >> (14u + posdiv));
+            }
+            IOLog("Tb375fcMali: CPU PLL (%s) MHz: cci=%u cl0=%u cl1=%u cl2=%u\n",
+                  tag, mhz[0], mhz[1], mhz[2], mhz[3]);
+        };
+        mapMmio(0x0c030000ULL, 0x1000u, &pllMap);
+        logPll("before");
+
+        if (mapMmio(0x0011b000ULL, 0x2000u, &csramMap)) {
+            static const uint32_t domOff[3] = {0xc10u, 0xd30u, 0xe50u};
+            /* Target daily-driver MHz: E-cluster(A510)=1800, P-cluster(A715)=2600, Prime(A715)=2800 */
+            static const uint32_t targetMhz[3] = {1800u, 2600u, 2800u};
+            for (int d = 0; d < 3; ++d) {
+                uintptr_t base = csramMap.va + domOff[d];
+                uint32_t en  = rd32(base, 0x84u);
+                uint32_t ps  = rd32(base, 0x88u);
+                uint32_t hw  = rd32(base, 0x8cu);
+                uint32_t l0  = rd32(base, 0x00u);
+                uint32_t l1  = rd32(base, 0x04u);
+                uint32_t l15 = rd32(base, 0x3cu);
+                uint32_t l31 = rd32(base, 0x7cu);
+                IOLog("Tb375fcMali: CPUHW dom%d en=%u ps=%u hw=%u lut[0,1,15,31]=0x%x,0x%x,0x%x,0x%x\n",
+                      d, en, ps, hw, l0, l1, l15, l31);
+                if (boostEn) {
+                    /* Scan 32-entry LUT for entry closest to targetMhz[d] (entries may be kHz or MHz) */
+                    uint32_t bestIdx = 0xFFFFFFFFu;
+                    uint32_t bestDiff = 0xFFFFFFFFu;
+                    uint32_t bestVal = 0u;
+                    uint32_t prev = 0xFFFFFFFFu;
+                    for (uint32_t i = 0; i < 32u; ++i) {
+                        uint32_t v = rd32(base, i * 4u);
+                        if (v == 0u || v == prev) continue;
+                        prev = v;
+                        uint32_t vmhz = (v & 0xFFFu);
+                        if (v >= 400000u && v <= 4000000u && (v % 1000u) == 0u) vmhz = v / 1000u;
+                        if (vmhz >= 400u && vmhz <= 3600u) {
+                            uint32_t diff = (vmhz > targetMhz[d]) ? (vmhz - targetMhz[d]) : (targetMhz[d] - vmhz);
+                            if (diff < bestDiff) { bestDiff = diff; bestIdx = i; bestVal = vmhz; }
+                        }
+                    }
+                    if (bestIdx != 0xFFFFFFFFu) {
+                        if (!en) wr32(base, 0x84u, 1u);
+                        wr32(base, 0x88u, bestIdx);
+                        IOLog("Tb375fcMali: CPUHW dom%d -> set idx=%u (%u MHz)\n", d, bestIdx, bestVal);
+                    }
+                }
+            }
+            IOSleep(10);
+            for (int d = 0; d < 3; ++d) {
+                uintptr_t base = csramMap.va + domOff[d];
+                IOLog("Tb375fcMali: CPUHW dom%d after: en=%u ps=%u hw=%u\n",
+                      d, rd32(base, 0x84u), rd32(base, 0x88u), rd32(base, 0x8cu));
+            }
+            unmapMmio(&csramMap);
+        }
+        logPll("after");
+        unmapMmio(&pllMap);
+    }
+
     if (!mapMmio(MT6897_MALI_PHYS, MT6897_MALI_MAP_SIZE, &gMali.maliReg)) {
         IOLog("Tb375fcMali: failed to map mali@13000000\n");
         return false;
@@ -1101,9 +1239,21 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         if (sz == 0 || sz > 512ULL * 1024ULL * 1024ULL) return kIOReturnBadArgument;
 
         IOBufferMemoryDescriptor *desc = nullptr;
-        /* Only allocate NO_MMAP or >= 8 MiB BOs (e.g. 84 MiB TLS scratch) in fTask pageable VM;
-         * keep all CPU-mmapped CS/desc/staging BOs (< 8 MiB) in KernelUserShared + WriteCombine! */
-        bool isLargeOrNoMmap = ((in->flags & MALI_BO_NO_MMAP) != 0) || (sz >= 8ULL * 1024ULL * 1024ULL);
+        /* Keep small CS/desc/shader BOs (< 4 MiB) in KernelUserShared + WriteCombine;
+         * allocate >= 4 MiB BOs (16 MiB m2v slabs, 84 MiB TLS) in fTask pageable VM so we
+         * never exhaust XNU's 128 MiB kmem_io map (which causes ubc_upl_map kr=0x3!). */
+        bool isLargeOrNoMmap = ((in->flags & MALI_BO_NO_MMAP) != 0) || (sz >= 4ULL * 1024ULL * 1024ULL);
+        if (!isLargeOrNoMmap) {
+            desc = IOBufferMemoryDescriptor::withOptions(
+                kIOMemoryKernelUserShared | kIODirectionInOut | kIOMapWriteCombineCache, sz, 4096);
+            if (desc && desc->prepare() == kIOReturnSuccess) {
+                memset(desc->getBytesNoCopy(), 0, sz);
+                cacheFlushRange(desc->getBytesNoCopy(), sz);
+            } else {
+                if (desc) { desc->release(); desc = nullptr; }
+                isLargeOrNoMmap = true;
+            }
+        }
         if (isLargeOrNoMmap) {
             /* Allocate large / GPU-only BOs (e.g. 84 MiB TLS scratch) in fTask user VM map
              * so we never exhaust kernel_map VA space! XNU zero-fills pageable VM pages automatically. */
@@ -1120,15 +1270,6 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
                 IOLog("Tb375fcMali: large BO %llu MiB OK in fTask (pa0=0x%llx)\n",
                       (unsigned long long)(sz >> 20), (unsigned long long)pa0);
             }
-        } else {
-            desc = IOBufferMemoryDescriptor::withOptions(
-                kIOMemoryKernelUserShared | kIODirectionInOut | kIOMapWriteCombineCache, sz, 4096);
-            if (!desc || desc->prepare() != kIOReturnSuccess) {
-                if (desc) desc->release();
-                return kIOReturnNoMemory;
-            }
-            memset(desc->getBytesNoCopy(), 0, sz);
-            cacheFlushRange(desc->getBytesNoCopy(), sz);
         }
 
         IOLockLock(fLock);

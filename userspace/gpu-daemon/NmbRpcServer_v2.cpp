@@ -1245,9 +1245,12 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             NmbTexture *t = nullptr;
             { std::lock_guard<std::mutex> dlk(dev_mu); t = nmb_texture_new_on_surface(b.get(), &d, off, bpr, pfmt, plane, w, h, coff, cbpr); }
             if (!t) {
-                gpud_log("[gpud] tex_on_surf FAILED client=%u (%llux%llu pfmt=0x%x off=0x%llx bpr=%llu): %s\n",
-                         client_id, (unsigned long long)w, (unsigned long long)h, pfmt,
-                         (unsigned long long)off, (unsigned long long)bpr, nmb_last_error());
+                static std::atomic<uint32_t> surfFailLog{0};
+                if (surfFailLog.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    gpud_log("[gpud] tex_on_surf FAILED client=%u (%llux%llu pfmt=0x%x off=0x%llx bpr=%llu): %s\n",
+                             client_id, (unsigned long long)w, (unsigned long long)h, pfmt,
+                             (unsigned long long)off, (unsigned long long)bpr, nmb_last_error());
+                }
                 reply_err(out, nmb_last_error());
             } else {
                 record_ws_scanout(client_id, bid, b, w, h, bpr, d.format, off);
