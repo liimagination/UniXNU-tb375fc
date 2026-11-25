@@ -104,6 +104,9 @@ static std::atomic<uint64_t> gC1Rpcs{0};
 static std::atomic<uint64_t> gC1Commits{0};
 static std::atomic<uint32_t> gC1LastOp{0};
 static std::atomic<uint64_t> gC1LastOpMs{0};
+static std::atomic<uint64_t> gOpCounts[128];
+static std::atomic<uint64_t> gBgWindowMs{0};
+static std::atomic<uint32_t> gBgWindowCount{0};
 static int gConsoleFd = -1;
 
 static uint64_t monotonic_ms() {
@@ -713,7 +716,7 @@ static bool replay_encoder_batch(ClientHandles &ch, NmbEncoder *enc, Reader &r) 
                     ok = true;
                 } else {
                     static std::atomic<uint32_t> drawIdxLog{0};
-                    if (drawIdxLog.fetch_add(1, std::memory_order_relaxed) < 64)
+                    if (drawIdxLog.fetch_add(1, std::memory_order_relaxed) < 8)
                         gpud_log("[gpud] idx-draw pid=%llu (%s) prim=%llu cnt=%u\n",
                                  (unsigned long long)cur_pid, pname.c_str(), (unsigned long long)prim, cnt);
                     auto buf = get_handle(ch.mu, ch.buffers, bid);
@@ -826,10 +829,27 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
     NmbDevice *dev = (client_id == 1 || !gBgDevice) ? gDevice : gBgDevice;
     std::mutex &dev_mu = (dev == gDevice) ? gVkMu : gBgVkMu;
     gRpcCount.fetch_add(1, std::memory_order_relaxed);
+    if (op < 128u) gOpCounts[op].fetch_add(1, std::memory_order_relaxed);
     if (client_id == 1) {
+        static thread_local bool c1QosSet = false;
+        if (!c1QosSet) {
+            c1QosSet = true;
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        }
         gC1Rpcs.fetch_add(1, std::memory_order_relaxed);
         gC1LastOp.store(op, std::memory_order_relaxed);
         gC1LastOpMs.store(monotonic_ms(), std::memory_order_relaxed);
+    } else {
+        /* Rate-limit rogue background RPC storms (e.g. iconservicesagent / NotificationCenter
+         * spinning at 6,600 RPCs/s) so WindowServer (client=1) is never starved of gVkMu or CPU! */
+        uint64_t now_ms = monotonic_ms();
+        uint64_t win_ms = gBgWindowMs.load(std::memory_order_relaxed);
+        if (now_ms >= win_ms + 100ULL) {
+            gBgWindowMs.store(now_ms, std::memory_order_relaxed);
+            gBgWindowCount.store(1u, std::memory_order_relaxed);
+        } else if (gBgWindowCount.fetch_add(1u, std::memory_order_relaxed) > 200u) {
+            usleep(5000);
+        }
     }
     struct WorkerGuard {
         WorkerGuard() { gActiveWorkers.fetch_add(1, std::memory_order_relaxed); }
@@ -2031,7 +2051,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
                         nmb_command_buffer_debug_state(cb.get(), dbgbuf, sizeof(dbgbuf));
                         gpud_log("[gpud] c1 commit #%llu (cbid=%llu) >15000ms [%s], continuing async\n",
                                  (unsigned long long)c, (unsigned long long)cbid, dbgbuf);
-                    } else if (c <= 60 || (c % 25) == 0) {
+                    } else if (c <= 20 || (c % 250) == 0) {
                         gpud_log("[gpud] c1 commit #%llu DONE in %llums (wrc=%d)\n",
                                  (unsigned long long)c, (unsigned long long)wdt, wrc);
                     }
@@ -2043,7 +2063,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
                         }
                     }
                 }
-                if (c <= 60 || (c % 25) == 0) gpud_log("[gpud] commit #%llu OK (client=%u cbid=%llu)\n", (unsigned long long)c, client_id, (unsigned long long)cbid);
+                if (c <= 8 || (c % 250) == 0) gpud_log("[gpud] commit #%llu OK (client=%u cbid=%llu)\n", (unsigned long long)c, client_id, (unsigned long long)cbid);
                 reply_ok(out);
             }
             break;
@@ -3042,11 +3062,17 @@ int main(int argc, char **argv) {
                 uint64_t now = monotonic_ms();
                 uint64_t last_ms = gC1LastOpMs.load(std::memory_order_relaxed);
                 uint64_t ago_s = (last_ms && now >= last_ms) ? (now - last_ms) / 1000ULL : 0;
-                gpud_log("[gpud] HB rpc=%llu c1_rpc=%llu c1_last_op=%u(%llus ago) active=%d in_pso=%d rpso=%llu cpso=%llu commits=%llu c1_commits=%llu\n",
+                uint32_t topOp = 0; uint64_t topCnt = 0;
+                for (uint32_t oi = 0; oi < 128u; ++oi) {
+                    uint64_t c = gOpCounts[oi].exchange(0, std::memory_order_relaxed);
+                    if (c > topCnt) { topCnt = c; topOp = oi; }
+                }
+                gpud_log("[gpud] HB rpc=%llu c1_rpc=%llu c1_last_op=%u(%llus ago) top_op=%u(%llu) active=%d in_pso=%d rpso=%llu cpso=%llu commits=%llu c1_commits=%llu\n",
                          (unsigned long long)rpcs,
                          (unsigned long long)gC1Rpcs.load(std::memory_order_relaxed),
                          gC1LastOp.load(std::memory_order_relaxed),
                          (unsigned long long)ago_s,
+                         topOp, (unsigned long long)topCnt,
                          gActiveWorkers.load(std::memory_order_relaxed),
                          gInPso.load(std::memory_order_relaxed),
                          (unsigned long long)gRenderPsoCount.load(std::memory_order_relaxed),

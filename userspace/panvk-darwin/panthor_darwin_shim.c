@@ -32,6 +32,7 @@ struct darwin_host_bo {
 
 static struct darwin_host_bo g_host_bos[MAX_DARWIN_HOST_BOS];
 static struct darwin_host_bo g_mmap_bos[MAX_DARWIN_HOST_BOS];
+static bool                  g_mmap_cached[MAX_DARWIN_HOST_BOS];
 
 static inline void arm64_dcache_clean(const void *addr, size_t len) {
     if (!addr || !len) return;
@@ -53,22 +54,28 @@ static inline void arm64_dcache_clean_inval(const void *addr, size_t len) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
-static void flush_all_host_bos(bool invalidate) {
+static void flush_all_host_bos(bool invalidate, size_t *out_hkb, size_t *out_mkb) {
+    size_t hbytes = 0, mbytes = 0;
     for (uint32_t i = 1; i < MAX_DARWIN_HOST_BOS; ++i) {
         void *p = g_host_bos[i].ptr;
         size_t sz = g_host_bos[i].size;
-        if (p && sz > 0 && sz <= (128ULL << 20)) {
+        /* Skip >= 2 MiB host IOSurfaces (large render targets/swapchain buffers; already cleaned on import) */
+        if (p && sz > 0 && sz < (2ULL << 20)) {
+            hbytes += sz;
             if (invalidate) arm64_dcache_clean_inval(p, sz);
             else            arm64_dcache_clean(p, sz);
         }
         p = g_mmap_bos[i].ptr;
         sz = g_mmap_bos[i].size;
-        /* BOs < 4 MiB use KernelUserShared + WriteCombine (uncached on CPU); >= 4 MiB live in fTask VM */
-        if (p && sz >= (4ULL << 20) && sz <= (128ULL << 20)) {
+        /* Only flush BOs that fell back to cached fTask VM (out.pad != 0); WriteCombine BOs need zero flush */
+        if (p && g_mmap_cached[i] && sz > 0 && sz <= (128ULL << 20)) {
+            mbytes += sz;
             if (invalidate) arm64_dcache_clean_inval(p, sz);
             else            arm64_dcache_clean(p, sz);
         }
     }
+    if (out_hkb) *out_hkb = hbytes >> 10;
+    if (out_mkb) *out_mkb = mbytes >> 10;
 }
 
 struct darwin_mali_fd {
@@ -290,7 +297,19 @@ static int wait_syncobj_fence(io_connect_t conn, struct darwin_syncobj *s, int64
     };
     struct Tb375fcMaliFenceWaitOut out = {0};
     size_t osz = sizeof(out);
+    struct timespec fw0, fw1;
+    clock_gettime(CLOCK_MONOTONIC, &fw0);
     int rc = call_mali(conn, MALI_SEL_FENCE_WAIT, &in, sizeof(in), &out, &osz);
+    clock_gettime(CLOCK_MONOTONIC, &fw1);
+    static uint32_t sFwLog = 0;
+    if (timeout_ns != 0 && ++sFwLog <= 25) {
+        long wUs = (fw1.tv_sec - fw0.tv_sec) * 1000000L + (fw1.tv_nsec - fw0.tv_nsec) / 1000L;
+        static int sFwCon = -2;
+        if (sFwCon == -2) sFwCon = open("/dev/console", O_WRONLY | O_NOCTTY);
+        char msg[128];
+        int n = snprintf(msg, sizeof(msg), "[panvk] fence #%u wait=%ldus rc=%d sig=%u\n", sFwLog, wUs, rc, out.signaled);
+        if (sFwCon >= 0 && n > 0) (void)write(sFwCon, msg, (size_t)n);
+    }
     if (rc == 0 && out.signaled) {
         /* Scanout IOSurfaces are invalidated by NativeLegacyDisplay (flush_dcache64)
          * and fbshot (arm64_dcache_clean_inval); m2v BOs < 24 MiB are WriteCombine.
@@ -759,6 +778,11 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
         struct Tb375fcMaliBoCreateOut out = {0};
         size_t osz = sizeof(out);
         if (call_mali(conn, MALI_SEL_BO_CREATE, &in, sizeof(in), &out, &osz) != 0) return -1;
+        if (out.bo_handle > 0 && out.bo_handle < MAX_DARWIN_HOST_BOS) {
+            pthread_mutex_lock(&g_lock);
+            g_mmap_cached[out.bo_handle] = (out.pad != 0);
+            pthread_mutex_unlock(&g_lock);
+        }
         req->handle = out.bo_handle;
         req->size = out.size;
         return 0;
@@ -778,6 +802,7 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
             g_host_bos[req->handle].size = 0;
             g_mmap_bos[req->handle].ptr = NULL;
             g_mmap_bos[req->handle].size = 0;
+            g_mmap_cached[req->handle] = false;
             pthread_mutex_unlock(&g_lock);
         }
         struct Tb375fcMaliHandleIn in = { .handle = req->handle, .pad = 0 };
@@ -872,9 +897,13 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
             }
         }
 
+        struct timespec ts0, ts1, ts2;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        size_t hkb = 0, mkb = 0;
         pthread_mutex_lock(&g_lock);
-        flush_all_host_bos(false);
+        flush_all_host_bos(false, &hkb, &mkb);
         pthread_mutex_unlock(&g_lock);
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
 
         struct Tb375fcMaliGroupSubmitOut out = {0};
         uint32_t total = req->queue_submits.count;
@@ -901,6 +930,18 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
                 size_t osz = sizeof(out);
                 if (call_mali(conn, MALI_SEL_GROUP_SUBMIT, &in, sizeof(in), &out, &osz) != 0) return -1;
             }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts2);
+        static uint32_t sSubLog = 0;
+        if (++sSubLog <= 25) {
+            long fUs = (ts1.tv_sec - ts0.tv_sec) * 1000000L + (ts1.tv_nsec - ts0.tv_nsec) / 1000L;
+            long iUs = (ts2.tv_sec - ts1.tv_sec) * 1000000L + (ts2.tv_nsec - ts1.tv_nsec) / 1000L;
+            static int sConFd = -2;
+            if (sConFd == -2) sConFd = open("/dev/console", O_WRONLY | O_NOCTTY);
+            char msg[160];
+            int n = snprintf(msg, sizeof(msg), "[panvk] submit #%u flush=%ldus (h=%zuKB m=%zuKB) ioctl=%ldus q=%u\n",
+                             sSubLog, fUs, hkb, mkb, iUs, total);
+            if (sConFd >= 0 && n > 0) (void)write(sConFd, msg, (size_t)n);
         }
 
         /* Attach fence_seq to all output syncobjs */

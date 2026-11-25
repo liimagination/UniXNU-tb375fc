@@ -637,6 +637,7 @@ static void vmFlushMmu(MaliVm *vm) {
 
 static void vmProgramAs(MaliVm *vm) {
     uint32_t as = vm->as_slot;
+    /* Mali Valhall AS_MEMATTR: AttrIdx 0 = 0x4C (NC), AttrIdx 1 = 0x8F (AARCH64_INNER_ALLOC_IMPL WB-RWA) */
     uint64_t memattr  = 0x4C4C4C4C4C4C8F4CULL;
     uint64_t transcfg = 6ULL | (7ULL << 6) | (1ULL << 24);
     wr64(gMali.maliReg.va, AS_REG(as, AS_TRANSTAB_LO), vm->l0Pa & 0x0000FFFFFFFFF000ULL);
@@ -708,7 +709,7 @@ static bool initMaliHardware(void) {
         uint32_t boostEn = 1u;
         PE_parse_boot_argn("boost", &boostEn, sizeof(boostEn));
 
-        /* 1. GPU OPP boost via GPUEB CMD_GET_FREQ_BY_IDX + CMD_COMMIT (target ~850 MHz) */
+        /* 1. GPU OPP boost via GPUEB CMD_GET_FREQ_BY_IDX + CMD_COMMIT (target ~950 MHz high-perf) */
         if (boostEn && gpuOppN > 0 && gpuOppN <= 128) {
             uint32_t bestIdx = gpuOppN / 2u;
             uint32_t bestDiff = 0xFFFFFFFFu;
@@ -727,7 +728,7 @@ static bool initMaliHardware(void) {
                     if (idx == gpuOppN / 2u) fMid = fk;
                     if (idx == gpuOppN - 1u) fEnd = fk;
                     if (fk >= 200000u && fk <= 1500000u) {
-                        uint32_t diff = (fk > 850000u) ? (fk - 850000u) : (850000u - fk);
+                        uint32_t diff = (fk > 1200000u) ? (fk - 1200000u) : (1200000u - fk);
                         if (diff < bestDiff) { bestDiff = diff; bestIdx = idx; bestFreq = fk; }
                     }
                 }
@@ -780,8 +781,8 @@ static bool initMaliHardware(void) {
 
         if (mapMmio(0x0011b000ULL, 0x2000u, &csramMap)) {
             static const uint32_t domOff[3] = {0xc10u, 0xd30u, 0xe50u};
-            /* Target daily-driver MHz: E-cluster(A510)=1800, P-cluster(A715)=2600, Prime(A715)=2800 */
-            static const uint32_t targetMhz[3] = {1800u, 2600u, 2800u};
+            /* High-perf smooth 60Hz+ MHz: E(A510)=2000, P(A715)=2800, Prime(A715)=3000 */
+            static const uint32_t targetMhz[3] = {2000u, 2800u, 3000u};
             for (int d = 0; d < 3; ++d) {
                 uintptr_t base = csramMap.va + domOff[d];
                 uint32_t en  = rd32(base, 0x84u);
@@ -1065,6 +1066,7 @@ constexpr uint32_t kMaxClientGroups = 8u;
 
 struct MaliBoEntry {
     bool                in_use;
+    bool                is_shared;
     IOMemoryDescriptor *desc;
     uint64_t            size;
 };
@@ -1096,6 +1098,7 @@ private:
     MaliBoEntry    *fBos;
     MaliVm         *fVms;
     MaliGroupEntry *fGroups;
+    uint64_t        fSharedBytes;
 public:
     bool initWithTask(task_t owningTask, void *securityToken, UInt32 type,
                       OSDictionary *properties) APPLE_KEXT_OVERRIDE;
@@ -1239,16 +1242,23 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         if (sz == 0 || sz > 512ULL * 1024ULL * 1024ULL) return kIOReturnBadArgument;
 
         IOBufferMemoryDescriptor *desc = nullptr;
-        /* Keep small CS/desc/shader BOs (< 4 MiB) in KernelUserShared + WriteCombine;
-         * allocate >= 4 MiB BOs (16 MiB m2v slabs, 84 MiB TLS) in fTask pageable VM so we
-         * never exhaust XNU's 128 MiB kmem_io map (which causes ubc_upl_map kr=0x3!). */
-        bool isLargeOrNoMmap = ((in->flags & MALI_BO_NO_MMAP) != 0) || (sz >= 4ULL * 1024ULL * 1024ULL);
+        /* Budget up to 40 MiB of kmem_io for KernelUserShared + WriteCombine BOs (covers
+         * first 2x 16 MiB m2v slabs + all small CS/desc/shader BOs with ZERO dc cvac needed,
+         * while keeping 88 MiB of kmem_io free so ubc_upl_map never hits KERN_NO_SPACE!). */
+        IOLockLock(fLock);
+        bool allowShared = ((in->flags & MALI_BO_NO_MMAP) == 0) &&
+                           (sz <= 16ULL * 1024ULL * 1024ULL) &&
+                           (fSharedBytes + sz <= 48ULL * 1024ULL * 1024ULL);
+        IOLockUnlock(fLock);
+        bool isLargeOrNoMmap = !allowShared;
+        bool usedShared = false;
         if (!isLargeOrNoMmap) {
             desc = IOBufferMemoryDescriptor::withOptions(
                 kIOMemoryKernelUserShared | kIODirectionInOut | kIOMapWriteCombineCache, sz, 4096);
             if (desc && desc->prepare() == kIOReturnSuccess) {
                 memset(desc->getBytesNoCopy(), 0, sz);
                 cacheFlushRange(desc->getBytesNoCopy(), sz);
+                usedShared = true;
             } else {
                 if (desc) { desc->release(); desc = nullptr; }
                 isLargeOrNoMmap = true;
@@ -1277,8 +1287,10 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         for (uint32_t i = 1; i < kMaxClientBos; ++i) {
             if (!fBos[i].in_use) {
                 fBos[i].in_use = true;
+                fBos[i].is_shared = usedShared;
                 fBos[i].desc = desc;
                 fBos[i].size = sz;
+                if (usedShared) fSharedBytes += sz;
                 handle = i;
                 break;
             }
@@ -1288,7 +1300,7 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
 
         auto *out = static_cast<Tb375fcMaliBoCreateOut *>(args->structureOutput);
         out->bo_handle = handle;
-        out->pad = 0;
+        out->pad = usedShared ? 0u : 1u; /* 0 = WriteCombine (no dc cvac), 1 = cached fTask VM */
         out->size = sz;
         args->structureOutputSize = sizeof(*out);
         return kIOReturnSuccess;
@@ -1303,7 +1315,9 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         IOMemoryDescriptor *desc = nullptr;
         if (fBos[h].in_use) {
             desc = fBos[h].desc;
+            if (fBos[h].is_shared && fSharedBytes >= fBos[h].size) fSharedBytes -= fBos[h].size;
             fBos[h].in_use = false;
+            fBos[h].is_shared = false;
             fBos[h].desc = nullptr;
             fBos[h].size = 0;
         }
@@ -1767,27 +1781,27 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
                 memset(pkt, 0, sizeof(pkt));
                 uint32_t n = 0;
                 if (sub.stream_size > 0 && sub.stream_addr != 0) {
-                    /* 0: MOV32 valReg, latest_flush */
-                    pkt[n++] = (2ULL << 56) | (valReg << 48) | static_cast<uint64_t>(sub.latest_flush);
-                    /* 1: FLUSH_CACHE2.clean_inv_all.no_wait.signal(0) valReg */
-                    pkt[n++] = (36ULL << 56) | (0ULL << 48) | (valReg << 40) | (0ULL << 16) | 0x233ULL;
-                    /* 2: MOV48 addrReg:addrReg+1, stream_addr */
+                    if (s == 0) {
+                        /* Only flush GPU caches before the first stream in the batch */
+                        pkt[n++] = (2ULL << 56) | (valReg << 48) | static_cast<uint64_t>(sub.latest_flush);
+                        pkt[n++] = (36ULL << 56) | (0ULL << 48) | (valReg << 40) | (0ULL << 16) | 0x233ULL;
+                        pkt[n++] = (3ULL << 56) | (1ULL << 16);
+                    }
+                    /* MOV48 addrReg:addrReg+1, stream_addr */
                     pkt[n++] = (1ULL << 56) | (addrReg << 48) | (sub.stream_addr & 0x0000FFFFFFFFFFFFULL);
-                    /* 3: MOV32 valReg, stream_size */
+                    /* MOV32 valReg, stream_size */
                     pkt[n++] = (2ULL << 56) | (valReg << 48) | static_cast<uint64_t>(sub.stream_size);
-                    /* 4: WAIT(0) */
-                    pkt[n++] = (3ULL << 56) | (1ULL << 16);
-                    /* 5: CALL addrReg:addrReg+1, valReg */
+                    /* CALL addrReg:addrReg+1, valReg */
                     pkt[n++] = (32ULL << 56) | (addrReg << 40) | (valReg << 32);
-                    /* 6: WAIT(all scoreboards) */
+                    /* WAIT(all scoreboards) */
                     pkt[n++] = (3ULL << 56) | (waitAll << 16);
-                    /* 7: MOV32 valReg, 0 */
-                    pkt[n++] = (2ULL << 56) | (valReg << 48);
-                    /* 8: FLUSH_CACHE2.clean_inv_all.no_wait.signal(0) valReg (flush GPU writes to DRAM) */
-                    pkt[n++] = (36ULL << 56) | (0ULL << 48) | (valReg << 40) | (0ULL << 16) | 0x233ULL;
-                    /* 9: WAIT(0) */
-                    pkt[n++] = (3ULL << 56) | (1ULL << 16);
-                    /* 10: ERROR_BARRIER */
+                    if (s + 1u == scnt) {
+                        /* Only flush GPU writes to DRAM after the last stream in the batch */
+                        pkt[n++] = (2ULL << 56) | (valReg << 48);
+                        pkt[n++] = (36ULL << 56) | (0ULL << 48) | (valReg << 40) | (0ULL << 16) | 0x233ULL;
+                        pkt[n++] = (3ULL << 56) | (1ULL << 16);
+                    }
+                    /* ERROR_BARRIER */
                     pkt[n++] = (47ULL << 56);
                 } else {
                     pkt[n++] = (3ULL << 56) | (waitAll << 16);
@@ -1875,12 +1889,12 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
             return ok;
         };
 
-        /* Fast spin for first 2ms (50us steps), then 1ms sleep */
-        for (int spin = 0; spin < 40; ++spin) {
+        /* Fast spin for first 5ms (50us steps) to avoid IOSleep(1) timer slack, then 1ms sleep */
+        for (int spin = 0; spin < 100; ++spin) {
             if (allQueuesDone()) { done = true; break; }
             IODelay(50);
         }
-        for (uint32_t ms = 2; !done && ms < maxMs; ++ms) {
+        for (uint32_t ms = 5; !done && ms < maxMs; ++ms) {
             if (allQueuesDone()) { done = true; break; }
             IOSleep(1);
         }
