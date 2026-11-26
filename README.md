@@ -30,7 +30,9 @@ UniXNU device port for **Lenovo Xiaoxin Pad Pro 12.7 (2025) / TB375FC** (MediaTe
   - Hardware rising-edge latch on `MT6897` `eint-n @ 0x11FE0000` (`EINT9` = local bit 5, `MTK_EINT_STA` only): zero idle SPI polling, responsive single taps and drags, `csum_err=0`.
 - **Storage Persistence & Offline Peripheral Prep**:
   - Bounded UFS 4.0 LUN2 `PersistOverlay` (`data-persist=2`) preserving user settings and shader caches across reboots.
-  - Offline P1 USB-C Host prep (`drivers/usb/Tb375fcUsbHost.cpp`, default `usb-host=0` inert) and native MT6897 ConnSys Wi-Fi/BT prep in progress.
+  - Offline peripheral prep (compiled offline, default inert `=0`, NOT linked into Boot 152):
+    - Native onboard MT6897 ConnSys Wi-Fi (`soc7_0`) & Bluetooth (`BGF/BEIF`): [drivers/wireless/Tb375fcConnSys.cpp](drivers/wireless/Tb375fcConnSys.cpp) + [drivers/wireless/NATIVE-CONNSYS-WIFI-BT-PLAN.md](drivers/wireless/NATIVE-CONNSYS-WIFI-BT-PLAN.md)
+    - USB-C Host (`mtu3`/`xHCI`): [drivers/usb/Tb375fcUsbHost.cpp](drivers/usb/Tb375fcUsbHost.cpp)
 
 ## Recommended Boot-Args (Boot 152)
 
@@ -47,4 +49,4 @@ mali=4 vm_compressor=2 vm_compression_limit=524288 aicr=2500 data-persist=2 disp
 | `feat/ufs-persist-jit` | P2 Bounded UFS 4.0 LUN2 `PersistOverlay` + persistence-safe `BootCacheControl` + SwiftShader disk JIT cache | Verified (Boot 66 / 70) |
 | `feat/display-120hz` | P4 MT6897 dual-DSI read-only probe + `NativeLegacyDisplay` `disp-hz=120` | Verified (Boot 67 / 70) |
 | `feat/mali-g615-csf` | P3 Part 1 GPUEB power-on + Mali-G615 LPAE `AS0` + CSF MCU v2.5 `GLB_PING` | Verified (Boot 62) |
-| `feat/mali-panvk-m2v2` | **Latest Active Branch (Boot 148)**: In-process `arm64e` Mali-G615 PanVK v11 + `metal2vulkan` + multi-process CSG Suspend/Resume + EINT9 touch + ~2.1 GiB `kmem` VA pools + GPU-display sync | Verified (Boot 148) |
+| `feat/mali-panvk-m2v2` | **Latest Active Branch (Boot 152)**: In-process `arm64e` Mali-G615 PanVK v11 + `metal2vulkan` + 8528 Mbps LPDDR5X + 1400 MHz GPU + AFBC + 1.3 ms 3-thread blit + `AppleSmartBattery` + Stage Manager + offline native ConnSys Wi-Fi/BT prep | Verified (Boot 152) |
