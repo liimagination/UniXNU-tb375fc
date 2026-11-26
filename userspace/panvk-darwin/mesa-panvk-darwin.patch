@@ -13,6 +13,69 @@ index 3aed8ca..25cc77d 100644
  else
    # We should prevent libdrm from being available when the target doesn't have it to avoid transitive
    # dependencies (such as vk-runtime) linking to it
+diff --git a/src/panfrost/compiler/bifrost/bi_ra.c b/src/panfrost/compiler/bifrost/bi_ra.c
+index c68acda..21f4bec 100644
+--- a/src/panfrost/compiler/bifrost/bi_ra.c
++++ b/src/panfrost/compiler/bifrost/bi_ra.c
+@@ -93,9 +93,11 @@ lcra_add_node_interference(struct lcra_state *l, unsigned i, unsigned cmask_i,
+       }
+    }
+ 
+-   /* Use dense arrays after adding 256 elements */
+-   nodearray_orr(&l->linear[j], i, constraint_fw, 256, l->node_count);
+-   nodearray_orr(&l->linear[i], j, constraint_bw, 256, l->node_count);
++   /* Use dense arrays only after adding 2048 elements (16 KiB sparse ceiling stays under
++    * macOS xzone's 32 KiB large-allocation madvise threshold, preventing 1+ GiB RAM blowup
++    * and 3+ min kernel madvise stalls on large CoreAnimation shaders). */
++   nodearray_orr(&l->linear[j], i, constraint_fw, 2048, l->node_count);
++   nodearray_orr(&l->linear[i], j, constraint_bw, 2048, l->node_count);
+ }
+ 
+ static bool
+@@ -349,6 +351,14 @@ bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
+          l->affinity[node] &= affinity;
+ 
+          for (unsigned i = 0; i < node_count; ++i) {
++            if ((i & 7u) == 0u && i + 8u <= node_count) {
++               uint64_t w = 0;
++               memcpy(&w, live + i, sizeof(w));
++               if (w == 0) {
++                  i += 7u;
++                  continue;
++               }
++            }
+             uint8_t r = live[i];
+ 
+             /* Nodes only interfere if they occupy
+@@ -1234,6 +1244,7 @@ bi_register_allocate(bi_context *ctx)
+     * since register allocation can spill too, but RA is really slow
+     * so the closer we get to having enough registers free, the better
+     */
++   unsigned register_demand = 0;
+    if (!(bifrost_debug & BIFROST_DBG_NOSSARA)) {
+       unsigned regs_to_use =
+          ((bifrost_debug & BIFROST_DBG_SPILL) && !ctx->inputs->is_blend) ? 16 : BI_MAX_REGS;
+@@ -1243,7 +1254,7 @@ bi_register_allocate(bi_context *ctx)
+       if (verbose) {
+          bi_print_shader(ctx, stderr);
+       }
+-      unsigned register_demand = bi_calc_register_demand(ctx);
++      register_demand = bi_calc_register_demand(ctx);
+       if (register_demand > regs_to_use) {
+          /* spill registers if we can */
+          if (ctx->inputs->is_blend)
+@@ -1272,8 +1283,9 @@ bi_register_allocate(bi_context *ctx)
+    bi_coalesce_tied(ctx);
+    squeeze_index(ctx);
+ 
+-   /* Try with reduced register pressure to improve thread count */
+-   if (ctx->arch >= 7) {
++   /* Try with reduced register pressure to improve thread count — skip when SSA demand
++    * already exceeds 32 registers so large shaders do not build & discard a doomed LCRA graph. */
++   if (ctx->arch >= 7 && (register_demand == 0 || register_demand <= 32)) {
+       l = bi_allocate_registers(ctx, &success, false);
+ 
+       if (success) {
 diff --git a/src/panfrost/genxml/decode.h b/src/panfrost/genxml/decode.h
 index e5829b0..412b2aa 100644
 --- a/src/panfrost/genxml/decode.h
@@ -626,7 +689,7 @@ index 09253ff..3052c0c 100644
  #define panvk_per_arch(name) panvk_arch_name(name, v12)
  #elif PAN_ARCH == 13
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index a5549a6..170be9d 100644
+index a5549a6..9416070 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
 @@ -66,6 +66,7 @@
@@ -678,7 +741,21 @@ index a5549a6..170be9d 100644
     case 12:
     case 13:
        break;
-@@ -1634,6 +1647,15 @@ panvk_GetPhysicalDeviceExternalBufferProperties(
+@@ -562,9 +575,10 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
+       [PANVK_QUEUE_FAMILY_GPU] = {
+          .queueFlags =
+             VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+-         /* On v10+ we can support up to 127 queues but this causes timeout on
+-            some CTS tests */
+-         .queueCount = arch >= 10 ? 2 : 1,
++         /* On TB375FC (7 hardware CSG slots shared across all macOS Metal apps),
++            expose 1 GPU queue per device so m2v shares one Mali CSG instead of
++            allocating an unused present queue CSG per process. */
++         .queueCount = 1,
+          .timestampValidBits =
+             arch >= 10 &&
+                   physical_device->kmod.dev->props.gpu_can_query_timestamp
+@@ -1634,6 +1648,15 @@ panvk_GetPhysicalDeviceExternalBufferProperties(
        features |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
                    VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
     }

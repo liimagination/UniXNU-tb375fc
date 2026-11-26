@@ -270,6 +270,32 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
     iokit_args[1:1] = ['-iquote', str(iokit_orig.parent)]
     subprocess.run(iokit_args, cwd=iokit_rec['directory'], check=True)
 
+    # Compile patched IOUserClient.cpo so IOServices with NativeSandboxGrantAll=true (Tb375fcMali)
+    # are accessible to all sandboxed macOS Metal clients in-process (WindowServer, Dock, Finder, apps).
+    iouc_obj = None
+    if mali_driver:
+        iouc_rec = json.JSONDecoder().raw_decode((builder['XNU_OBJ'] / 'iokit/DEVELOPMENT/IOUserClient.cpo.json').read_text())[0]
+        iouc_orig = Path(iouc_rec['file'])
+        if not iouc_orig.is_absolute():
+            iouc_orig = Path(iouc_rec['directory']) / iouc_orig
+        iouc_src_txt = iouc_orig.read_text()
+        old_grant = 'native_sandbox_grant(IOService * service)\n{\n\tOSString * list = OSDynamicCast(OSString, service->getProperty("NativeSandboxGrantProcess"));'
+        new_grant = (
+            'native_sandbox_grant(IOService * service)\n{\n'
+            '\tif (service->getProperty("NativeSandboxGrantAll") == kOSBooleanTrue) {\n'
+            '\t\treturn true;\n'
+            '\t}\n'
+            '\tOSString * list = OSDynamicCast(OSString, service->getProperty("NativeSandboxGrantProcess"));'
+        )
+        assert old_grant in iouc_src_txt, 'Expected native_sandbox_grant in IOUserClient.cpp'
+        iouc_src = kout / 'IOUserClient.cpp'
+        iouc_src.write_text(iouc_src_txt.replace(old_grant, new_grant, 1))
+        iouc_obj = kout / 'IOUserClient.cpo'
+        iouc_args = builder['build_cmd_from_record'](iouc_rec, iouc_src, iouc_obj, [])
+        iouc_args[1:1] = ['-iquote', str(iouc_orig.parent)]
+        subprocess.run(iouc_args, cwd=iouc_rec['directory'], check=True)
+        print('      Compiled IOUserClient.cpo with NativeSandboxGrantAll support', flush=True)
+
     # Compile Tb375fcDummyEth.cpp (virtual en0 IOEthernetController) with late-init + IONetworkingFamily KC bindings
     eth_src = DESKTOP_DIR / 'Tb375fcDummyEth.cpp'
     assert eth_src.is_file(), f'Missing {eth_src}'
@@ -348,6 +374,10 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
     kmatches = [i for i, x in enumerate(src_lines) if Path(x).name == 'kern_exec.o']
     assert len(kmatches) == 1, f'Expected 1 kern_exec.o, got {len(kmatches)}'
     src_lines[kmatches[0]] = str(kexec_obj)
+    if iouc_obj is not None:
+        umatches = [i for i, x in enumerate(src_lines) if Path(x).name == 'IOUserClient.cpo']
+        assert len(umatches) == 1, f'Expected 1 IOUserClient.cpo, got {len(umatches)}'
+        src_lines[umatches[0]] = str(iouc_obj)
     vmk_o = TIER3_KDIR / 'vm_kern.o'
     if vmk_o.is_file():
         vmatches = [i for i, x in enumerate(src_lines) if Path(x).name == 'vm_kern.o']
@@ -531,10 +561,14 @@ def main():
                         help='link Tb375fcMaliDriver IOUserClient (libTb375fcTouch_mali4.a) for mali=4')
     parser.add_argument('--panvk-icd', type=Path, default=None,
                         help='pack Mesa panvk libvulkan_panfrost.dylib instead of SwiftShader')
+    parser.add_argument('--inproc-bundle', type=Path, default=None,
+                        help='pack self-contained arm64e in-process NativeAdrenoMetal.bundle (contains libvulkan_panfrost.dylib)')
     parser.add_argument('--extra-boot-arg', action='append', default=[],
                         help='additional XNU boot-arg (repeatable)')
     parser.add_argument('--het-clusters', action='store_true',
                         help='tag ADT cpu0..3 as E-cluster (A510) and cpu4..7 as P-cluster (A715)')
+    parser.add_argument('--no-notch', action='store_true',
+                        help='clear ADT /product/partially-occluded-display & has-round-cornered-mac-display so flat LCD hides MacBook notch/island')
     args = parser.parse_args()
     if args.menu_timeout is not None and args.menu_timeout < 1:
         parser.error('--menu-timeout must leave time to enter the menu')
@@ -576,8 +610,12 @@ def main():
     if not custom_ss.is_file():
         custom_ss = DESKTOP_DIR / 'libvk_swiftshader.o0.dylib'
     swiftshader = custom_ss if custom_ss.is_file() else (M7_DIR / 'swiftshader/libvk_swiftshader.hostmem.dylib')
-    print(f"[build] SwiftShader: {swiftshader.name}")
-    bundle = M7_DIR / 'plugin/NativeAdrenoMetal.bundle'
+    bundle = args.inproc_bundle.resolve() if args.inproc_bundle else (M7_DIR / 'plugin/NativeAdrenoMetal.bundle')
+    if args.inproc_bundle:
+        assert bundle.is_dir(), f'Missing in-process bundle: {bundle}'
+        print(f'[build] In-Process Metal Bundle: {bundle}')
+    else:
+        print(f"[build] SwiftShader: {swiftshader.name}")
 
     baseline_fat_lzma = PACK_M7 / 'board-m7-v3/readback/fatpart.lzma'
     base_v4_dir = PACK_M7 / 'board-m7-v4'
@@ -606,7 +644,13 @@ def main():
                 ('sbin/tb375fc-gpu-daemon', 0o755, active_daemon.read_bytes()),
             ]
         else:
-            if args.panvk_icd and args.panvk_icd.is_file():
+            if args.inproc_bundle:
+                print(f"[build] In-Process mode: packing {bundle.name} + {active_daemon.name} (no RPC GPU daemon)")
+                addon_entries = [
+                    ('sbin/BootCacheControl', 0o755, launcher.read_bytes()),
+                    ('sbin/tb375fc-gpu-daemon', 0o755, active_daemon.read_bytes()),
+                ]
+            elif args.panvk_icd and args.panvk_icd.is_file():
                 print(f"[build] Vulkan ICD: Mesa panvk ({args.panvk_icd.name})")
                 addon_entries = [
                     ('sbin/BootCacheControl', 0o755, launcher.read_bytes()),
@@ -623,7 +667,7 @@ def main():
                 if not path.is_file():
                     continue
                 rel = path.relative_to(bundle).as_posix()
-                mode = 0o755 if path.name == 'NativeAdrenoMetal' else 0o644
+                mode = 0o755 if (path.name == 'NativeAdrenoMetal' or path.suffix == '.dylib') else 0o644
                 addon_entries.append((f'GPUBundles/NativeAdrenoMetal.bundle/{rel}', mode, path.read_bytes()))
             touch_fw = DESKTOP_DIR / 'novatek_ts_fw_tm.bin'
             if touch_fw.is_file():
@@ -634,14 +678,20 @@ def main():
         addon_p = work / 'kernel.macho.gpuaddon'
         addon_p.write_bytes(pack_m7.make_addon(addon_entries))
 
-        # Build updated trustcache (include both daemon_hash and custom SwiftShader dylib hash if present)
+        # Build updated trustcache (include daemon, launcher, bundle, and embedded/external Vulkan ICD)
         orig_trust = work / 'orig.trustcache'
         new_trust = work / 'kernel.macho.trustcache'
         tool('mcopy', src_inner, BOOT + 'kernel.macho.trustcache', orig_trust)
         trust_hashes = [daemon_hash]
         if launcher == custom_launcher:
             trust_hashes.append(signed_cdhash(launcher))
-        if not cpu_only and args.panvk_icd and args.panvk_icd.is_file():
+        if not cpu_only and args.inproc_bundle:
+            trust_hashes.append(signed_cdhash(bundle))
+            inproc_panvk = bundle / 'Contents/MacOS/libvulkan_panfrost.dylib'
+            if inproc_panvk.is_file():
+                trust_hashes.append(signed_cdhash(inproc_panvk))
+            print(f'[build] TrustCache hashes (in-proc): {trust_hashes}')
+        elif not cpu_only and args.panvk_icd and args.panvk_icd.is_file():
             trust_hashes.append(signed_cdhash(args.panvk_icd))
         elif not cpu_only and swiftshader == custom_ss:
             trust_hashes.append(signed_cdhash(swiftshader))
@@ -665,6 +715,14 @@ def main():
         d_props.append(('vmm-present', struct.pack('<I', 1)))
         d_props.append(('sleep-disabled', struct.pack('<I', 1)))
         tree[1][d_idx] = (d_props, tree[1][d_idx][1])
+        if args.no_notch:
+            p_idx = next(i for i, c in enumerate(tree[1]) if dict(c[0]).get('name', b'').rstrip(b'\0') == b'product')
+            p_props = [(k, v) for k, v in tree[1][p_idx][0]
+                       if k not in ('partially-occluded-display', 'has-round-cornered-mac-display')]
+            p_props.append(('partially-occluded-display', struct.pack('<I', 0)))
+            p_props.append(('has-round-cornered-mac-display', struct.pack('<I', 0)))
+            tree[1][p_idx] = (p_props, tree[1][p_idx][1])
+            print('      ADT /product notch/island disabled: partially-occluded-display=0, has-round-cornered-mac-display=0', flush=True)
         if args.het_clusters:
             c_idx = next(i for i, c in enumerate(tree[1]) if dict(c[0]).get('name', b'').rstrip(b'\0') == b'cpus')
             new_cpus = []

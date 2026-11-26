@@ -18,12 +18,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_DARWIN_FDS      32
-#define MAX_DARWIN_SYNCOBJ  4096
-#define MAX_DARWIN_HOST_BOS 16384
+#define MAX_DARWIN_FDS             32
+#define MAX_DARWIN_SYNCOBJ         4096
+#define MAX_DARWIN_SYNCOBJ_PENDING 128
+#define MAX_DARWIN_HOST_BOS        16384
+
+#ifndef DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL        (1u << 0)
+#endif
+#ifndef DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT (1u << 1)
+#endif
+#ifndef DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE
+#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE  (1u << 2)
+#endif
+#ifndef DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED
+#define DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED (1u << 0)
+#endif
 
 struct darwin_host_bo {
     void  *ptr;
@@ -32,7 +47,20 @@ struct darwin_host_bo {
 
 static struct darwin_host_bo g_host_bos[MAX_DARWIN_HOST_BOS];
 static struct darwin_host_bo g_mmap_bos[MAX_DARWIN_HOST_BOS];
+static struct darwin_host_bo g_anon_bos[MAX_DARWIN_HOST_BOS];
 static bool                  g_mmap_cached[MAX_DARWIN_HOST_BOS];
+static uint16_t              g_anon_map_cnt[MAX_DARWIN_HOST_BOS];
+static uint32_t              g_max_bo_handle = 0;
+
+static inline int64_t now_mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+static inline void note_bo_handle_locked(uint32_t h) {
+    if (h > g_max_bo_handle && h < MAX_DARWIN_HOST_BOS) g_max_bo_handle = h;
+}
 
 static inline void arm64_dcache_clean(const void *addr, size_t len) {
     if (!addr || !len) return;
@@ -56,7 +84,9 @@ static inline void arm64_dcache_clean_inval(const void *addr, size_t len) {
 
 static void flush_all_host_bos(bool invalidate, size_t *out_hkb, size_t *out_mkb) {
     size_t hbytes = 0, mbytes = 0;
-    for (uint32_t i = 1; i < MAX_DARWIN_HOST_BOS; ++i) {
+    uint32_t max_h = g_max_bo_handle;
+    if (max_h >= MAX_DARWIN_HOST_BOS) max_h = MAX_DARWIN_HOST_BOS - 1;
+    for (uint32_t i = 1; i <= max_h; ++i) {
         void *p = g_host_bos[i].ptr;
         size_t sz = g_host_bos[i].size;
         /* Skip >= 2 MiB host IOSurfaces (large render targets/swapchain buffers; already cleaned on import) */
@@ -67,7 +97,8 @@ static void flush_all_host_bos(bool invalidate, size_t *out_hkb, size_t *out_mkb
         }
         p = g_mmap_bos[i].ptr;
         sz = g_mmap_bos[i].size;
-        /* Only flush BOs that fell back to cached fTask VM (out.pad != 0); WriteCombine BOs need zero flush */
+        /* Only flush actively CPU-mapped BOs that use cached Normal-WB mappings.
+         * Unmapped Private GPU BOs (anon_bos never passed to mmap) and kernel WriteCombine BOs need zero flush. */
         if (p && g_mmap_cached[i] && sz > 0 && sz <= (128ULL << 20)) {
             mbytes += sz;
             if (invalidate) arm64_dcache_clean_inval(p, sz);
@@ -86,16 +117,22 @@ struct darwin_mali_fd {
     bool          info_valid;
 };
 
+struct darwin_sync_pending {
+    uint64_t point;
+    uint32_t group;
+    uint64_t fence_seq;
+    bool     done;
+};
+
 struct darwin_syncobj {
     bool     in_use;
     uint64_t signaled_point;
-    uint32_t pending_group;
-    uint64_t pending_fence_seq;
-    uint64_t pending_point;
-    bool     has_pending;
+    uint32_t pending_count;
+    struct darwin_sync_pending pending[MAX_DARWIN_SYNCOBJ_PENDING];
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_bo_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_sync_cond = PTHREAD_COND_INITIALIZER;
 static struct darwin_mali_fd g_fds[MAX_DARWIN_FDS];
 static struct darwin_syncobj g_syncs[MAX_DARWIN_SYNCOBJ];
@@ -136,6 +173,15 @@ int panthor_darwin_open_render_node(void) {
     }
 
     int dummy_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (dummy_fd < 0) dummy_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (dummy_fd < 0) {
+        int pfd[2] = {-1, -1};
+        if (pipe(pfd) == 0) {
+            close(pfd[1]);
+            dummy_fd = pfd[0];
+            fcntl(dummy_fd, F_SETFD, FD_CLOEXEC);
+        }
+    }
     if (dummy_fd < 0) {
         IOServiceClose(conn);
         return -1;
@@ -180,6 +226,24 @@ void *panthor_darwin_mmap_bo(int fd, uint64_t mmap_offset, size_t size) {
     io_connect_t conn = fd_to_conn(fd);
     if (conn == MACH_PORT_NULL) { errno = EBADF; return (void *)-1; }
     uint32_t bo_handle = (uint32_t)(mmap_offset >> 12);
+    /* For anon-mmap BOs (imported via BO_IMPORT_HOST), return the single Normal-WB mapping
+     * directly: zero IOConnectMapMemory64 double-mapping, zero ARM64 WB/NC cache aliasing!
+     * Only register in g_mmap_bos[] once CPU actually maps it, so unmapped Private GPU
+     * textures never pay CPU dc civac overhead on submit. */
+    if (bo_handle > 0 && bo_handle < MAX_DARWIN_HOST_BOS) {
+        pthread_mutex_lock(&g_bo_lock);
+        void *ap = g_anon_bos[bo_handle].ptr;
+        size_t asz = g_anon_bos[bo_handle].size;
+        if (ap) {
+            g_mmap_bos[bo_handle].ptr = ap;
+            g_mmap_bos[bo_handle].size = asz;
+            g_mmap_cached[bo_handle] = true;
+            g_anon_map_cnt[bo_handle]++;
+            note_bo_handle_locked(bo_handle);
+        }
+        pthread_mutex_unlock(&g_bo_lock);
+        if (ap) return ap;
+    }
     mach_vm_address_t addr = 0;
     mach_vm_size_t map_size = size;
     kern_return_t kr = IOConnectMapMemory64(conn, bo_handle, mach_task_self(),
@@ -190,10 +254,11 @@ void *panthor_darwin_mmap_bo(int fd, uint64_t mmap_offset, size_t size) {
         return (void *)-1;
     }
     if (bo_handle > 0 && bo_handle < MAX_DARWIN_HOST_BOS) {
-        pthread_mutex_lock(&g_lock);
+        pthread_mutex_lock(&g_bo_lock);
         g_mmap_bos[bo_handle].ptr = (void *)(uintptr_t)addr;
         g_mmap_bos[bo_handle].size = (size_t)map_size;
-        pthread_mutex_unlock(&g_lock);
+        note_bo_handle_locked(bo_handle);
+        pthread_mutex_unlock(&g_bo_lock);
     }
     return (void *)(uintptr_t)addr;
 }
@@ -201,12 +266,23 @@ void *panthor_darwin_mmap_bo(int fd, uint64_t mmap_offset, size_t size) {
 int panthor_darwin_munmap_bo(int fd, void *addr, size_t size) {
     io_connect_t conn = fd_to_conn(fd);
     if (conn == MACH_PORT_NULL || !addr) return 0;
-    if (size > 0 && size <= (128ULL << 20)) {
-        arm64_dcache_clean(addr, size);
-    }
     uint32_t found_handle = 0;
-    pthread_mutex_lock(&g_lock);
-    for (uint32_t i = 1; i < MAX_DARWIN_HOST_BOS; ++i) {
+    bool is_anon = false;
+    pthread_mutex_lock(&g_bo_lock);
+    uint32_t max_h = g_max_bo_handle;
+    if (max_h >= MAX_DARWIN_HOST_BOS) max_h = MAX_DARWIN_HOST_BOS - 1;
+    for (uint32_t i = 1; i <= max_h; ++i) {
+        if (g_anon_bos[i].ptr == addr) {
+            is_anon = true;
+            found_handle = i;
+            if (g_anon_map_cnt[i] > 0) g_anon_map_cnt[i]--;
+            if (g_anon_map_cnt[i] == 0) {
+                g_mmap_bos[i].ptr = NULL;
+                g_mmap_bos[i].size = 0;
+                g_mmap_cached[i] = false;
+            }
+            break;
+        }
         if (g_mmap_bos[i].ptr == addr) {
             found_handle = i;
             g_mmap_bos[i].ptr = NULL;
@@ -214,7 +290,15 @@ int panthor_darwin_munmap_bo(int fd, void *addr, size_t size) {
             break;
         }
     }
-    pthread_mutex_unlock(&g_lock);
+    pthread_mutex_unlock(&g_bo_lock);
+    if (is_anon) {
+        /* Keep anon mmap alive until DRM_IOCTL_GEM_CLOSE unwires it via MALI_SEL_BO_DESTROY */
+        if (size > 0 && size <= (128ULL << 20)) arm64_dcache_clean_inval(addr, size);
+        return 0;
+    }
+    if (size > 0 && size <= (128ULL << 20)) {
+        arm64_dcache_clean(addr, size);
+    }
     (void)IOConnectUnmapMemory64(conn, found_handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)addr);
     return 0;
 }
@@ -249,10 +333,11 @@ int panthor_darwin_import_host_handle(int fd, void *host_ptr, uint64_t size,
     if (call_mali(conn, MALI_SEL_BO_IMPORT_HOST, &in, sizeof(in), &out, &osz) != 0)
         return -1;
     if (out.bo_handle > 0 && out.bo_handle < MAX_DARWIN_HOST_BOS) {
-        pthread_mutex_lock(&g_lock);
+        pthread_mutex_lock(&g_bo_lock);
         g_host_bos[out.bo_handle].ptr = host_ptr;
         g_host_bos[out.bo_handle].size = (size_t)out.size;
-        pthread_mutex_unlock(&g_lock);
+        note_bo_handle_locked(out.bo_handle);
+        pthread_mutex_unlock(&g_bo_lock);
     }
     if (out_handle) *out_handle = out.bo_handle;
     if (out_size) *out_size = out.size;
@@ -285,15 +370,121 @@ static int ensure_dev_info(int fd, struct Tb375fcMaliDevInfo *out) {
     return 0;
 }
 
-/* ---- Syncobj helpers ---- */
+/* ---- Timeline Syncobj engine ---- */
 
-static int wait_syncobj_fence(io_connect_t conn, struct darwin_syncobj *s, int64_t timeout_ns) {
-    if (!s->has_pending) return 0;
+static void syncobj_prune_locked(struct darwin_syncobj *s) {
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < s->pending_count; ++i) {
+        if (s->pending[i].point > s->signaled_point) {
+            if (w != i) s->pending[w] = s->pending[i];
+            w++;
+        }
+    }
+    s->pending_count = w;
+}
+
+static void syncobj_add_pending_locked(struct darwin_syncobj *s, uint64_t point,
+                                       uint32_t group, uint64_t fence_seq) {
+    if (point <= s->signaled_point) return;
+    for (uint32_t i = 0; i < s->pending_count; ++i) {
+        if (s->pending[i].point == point && s->pending[i].group == group) {
+            if (fence_seq > s->pending[i].fence_seq) s->pending[i].fence_seq = fence_seq;
+            s->pending[i].done = false;
+            return;
+        }
+    }
+    if (s->pending_count < MAX_DARWIN_SYNCOBJ_PENDING) {
+        struct darwin_sync_pending *e = &s->pending[s->pending_count++];
+        e->point = point;
+        e->group = group;
+        e->fence_seq = fence_seq;
+        e->done = false;
+        return;
+    }
+    /* Overflow fallback: replace earliest-point entry on same group (or slot 0) */
+    uint32_t victim = 0;
+    for (uint32_t i = 1; i < s->pending_count; ++i) {
+        if (s->pending[i].point < s->pending[victim].point) victim = i;
+    }
+    s->pending[victim].point = point;
+    s->pending[victim].group = group;
+    s->pending[victim].fence_seq = fence_seq;
+    s->pending[victim].done = false;
+}
+
+static void syncobj_mark_group_seq_done_locked(uint32_t group, uint64_t completed_seq) {
+    for (uint32_t h = 1; h < MAX_DARWIN_SYNCOBJ; ++h) {
+        struct darwin_syncobj *s = &g_syncs[h];
+        if (!s->in_use || s->pending_count == 0) continue;
+        bool touched = false;
+        for (uint32_t i = 0; i < s->pending_count; ++i) {
+            if (!s->pending[i].done && s->pending[i].group == group &&
+                s->pending[i].fence_seq <= completed_seq) {
+                s->pending[i].done = true;
+                touched = true;
+            }
+        }
+        if (!touched) continue;
+        for (uint32_t i = 0; i < s->pending_count; ++i) {
+            uint64_t pt = s->pending[i].point;
+            if (pt <= s->signaled_point) continue;
+            bool all_done = true;
+            for (uint32_t j = 0; j < s->pending_count; ++j) {
+                if (s->pending[j].point == pt && !s->pending[j].done) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done && pt > s->signaled_point) s->signaled_point = pt;
+        }
+        syncobj_prune_locked(s);
+    }
+}
+
+static bool syncobj_has_point_available_locked(const struct darwin_syncobj *s, uint64_t target) {
+    if (s->signaled_point >= target) return true;
+    for (uint32_t i = 0; i < s->pending_count; ++i) {
+        if (s->pending[i].point >= target) return true;
+    }
+    return false;
+}
+
+static uint64_t syncobj_max_submitted_locked(const struct darwin_syncobj *s) {
+    uint64_t m = s->signaled_point;
+    for (uint32_t i = 0; i < s->pending_count; ++i) {
+        if (s->pending[i].point > m) m = s->pending[i].point;
+    }
+    return m;
+}
+
+static bool syncobj_find_wait_fence_locked(const struct darwin_syncobj *s, uint64_t target,
+                                           uint32_t *out_group, uint64_t *out_seq) {
+    bool found = false;
+    uint64_t best_pt = UINT64_MAX;
+    uint32_t best_grp = 0;
+    uint64_t best_seq = 0;
+    for (uint32_t i = 0; i < s->pending_count; ++i) {
+        const struct darwin_sync_pending *e = &s->pending[i];
+        if (!e->done && e->point >= target && (!found || e->point < best_pt)) {
+            found = true;
+            best_pt = e->point;
+            best_grp = e->group;
+            best_seq = e->fence_seq;
+        }
+    }
+    if (found) {
+        if (out_group) *out_group = best_grp;
+        if (out_seq) *out_seq = best_seq;
+    }
+    return found;
+}
+
+static int wait_group_fence(io_connect_t conn, uint32_t group, uint64_t fence_seq, int64_t rel_timeout_ns) {
     struct Tb375fcMaliFenceWaitIn in = {
-        .group_handle = s->pending_group,
+        .group_handle = group,
         .pad = 0,
-        .fence_seq = s->pending_fence_seq,
-        .timeout_ns = (timeout_ns < 0) ? 10000000000ULL : (uint64_t)timeout_ns,
+        .fence_seq = fence_seq,
+        .timeout_ns = (rel_timeout_ns < 0) ? 10000000000ULL : (uint64_t)rel_timeout_ns,
     };
     struct Tb375fcMaliFenceWaitOut out = {0};
     size_t osz = sizeof(out);
@@ -302,24 +493,18 @@ static int wait_syncobj_fence(io_connect_t conn, struct darwin_syncobj *s, int64
     int rc = call_mali(conn, MALI_SEL_FENCE_WAIT, &in, sizeof(in), &out, &osz);
     clock_gettime(CLOCK_MONOTONIC, &fw1);
     static uint32_t sFwLog = 0;
-    if (timeout_ns != 0 && ++sFwLog <= 25) {
+    if (rel_timeout_ns != 0 && ++sFwLog <= 12) {
         long wUs = (fw1.tv_sec - fw0.tv_sec) * 1000000L + (fw1.tv_nsec - fw0.tv_nsec) / 1000L;
-        static int sFwCon = -2;
-        if (sFwCon == -2) sFwCon = open("/dev/console", O_WRONLY | O_NOCTTY);
-        char msg[128];
-        int n = snprintf(msg, sizeof(msg), "[panvk] fence #%u wait=%ldus rc=%d sig=%u\n", sFwLog, wUs, rc, out.signaled);
-        if (sFwCon >= 0 && n > 0) (void)write(sFwCon, msg, (size_t)n);
+        struct Tb375fcMaliDebugLogIn dlog;
+        memset(&dlog, 0, sizeof(dlog));
+        snprintf(dlog.msg, sizeof(dlog.msg) - 1, "[panvk:%s] fence #%u wait=%ldus rc=%d sig=%u",
+                 getprogname(), sFwLog, wUs, rc, out.signaled);
+        (void)call_mali(conn, MALI_SEL_DEBUG_LOG, &dlog, sizeof(dlog), NULL, NULL);
     }
     if (rc == 0 && out.signaled) {
-        /* Scanout IOSurfaces are invalidated by NativeLegacyDisplay (flush_dcache64)
-         * and fbshot (arm64_dcache_clean_inval); m2v BOs < 24 MiB are WriteCombine.
-         * Skipping redundant ~50 MiB dc civac here cuts commit latency in half. */
-        if (s->pending_point > s->signaled_point)
-            s->signaled_point = s->pending_point;
-        s->has_pending = false;
         return 0;
     }
-    errno = ETIMEDOUT;
+    errno = ETIME;
     return -1;
 }
 
@@ -346,8 +531,12 @@ int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle) {
 int drmSyncobjDestroy(int fd, uint32_t handle) {
     (void)fd;
     pthread_mutex_lock(&g_lock);
-    if (handle > 0 && handle < MAX_DARWIN_SYNCOBJ)
+    if (handle > 0 && handle < MAX_DARWIN_SYNCOBJ) {
         g_syncs[handle].in_use = false;
+        g_syncs[handle].pending_count = 0;
+        g_syncs[handle].signaled_point = 0;
+        pthread_cond_broadcast(&g_sync_cond);
+    }
     pthread_mutex_unlock(&g_lock);
     return 0;
 }
@@ -359,7 +548,7 @@ int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count) {
         uint32_t h = handles[i];
         if (h > 0 && h < MAX_DARWIN_SYNCOBJ && g_syncs[h].in_use) {
             g_syncs[h].signaled_point = 0;
-            g_syncs[h].has_pending = false;
+            g_syncs[h].pending_count = 0;
         }
     }
     pthread_mutex_unlock(&g_lock);
@@ -373,7 +562,7 @@ int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count) {
         uint32_t h = handles[i];
         if (h > 0 && h < MAX_DARWIN_SYNCOBJ && g_syncs[h].in_use) {
             if (g_syncs[h].signaled_point == 0) g_syncs[h].signaled_point = 1;
-            g_syncs[h].has_pending = false;
+            g_syncs[h].pending_count = 0;
         }
     }
     pthread_cond_broadcast(&g_sync_cond);
@@ -389,7 +578,7 @@ int drmSyncobjTimelineSignal(int fd, const uint32_t *handles, uint64_t *points, 
         if (h > 0 && h < MAX_DARWIN_SYNCOBJ && g_syncs[h].in_use) {
             if (points[i] > g_syncs[h].signaled_point)
                 g_syncs[h].signaled_point = points[i];
-            g_syncs[h].has_pending = false;
+            syncobj_prune_locked(&g_syncs[h]);
         }
     }
     pthread_cond_broadcast(&g_sync_cond);
@@ -398,28 +587,54 @@ int drmSyncobjTimelineSignal(int fd, const uint32_t *handles, uint64_t *points, 
 }
 
 int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count, uint32_t flags) {
-    (void)flags;
     io_connect_t conn = fd_to_conn(fd);
+    bool last_submitted = (flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED) != 0;
     pthread_mutex_lock(&g_lock);
     for (uint32_t i = 0; i < handle_count; ++i) {
         uint32_t h = handles[i];
-        if (h > 0 && h < MAX_DARWIN_SYNCOBJ && g_syncs[h].in_use) {
-            if (g_syncs[h].has_pending && conn != MACH_PORT_NULL) {
-                struct darwin_syncobj copy = g_syncs[h];
-                pthread_mutex_unlock(&g_lock);
-                if (wait_syncobj_fence(conn, &copy, 0) == 0) {
-                    pthread_mutex_lock(&g_lock);
-                    if (copy.signaled_point > g_syncs[h].signaled_point)
-                        g_syncs[h].signaled_point = copy.signaled_point;
-                    g_syncs[h].has_pending = false;
-                } else {
-                    pthread_mutex_lock(&g_lock);
+        if (h == 0 || h >= MAX_DARWIN_SYNCOBJ || !g_syncs[h].in_use) {
+            points[i] = 0;
+            continue;
+        }
+        if (last_submitted) {
+            points[i] = syncobj_max_submitted_locked(&g_syncs[h]);
+            continue;
+        }
+        if (g_syncs[h].pending_count > 0 && conn != MACH_PORT_NULL) {
+            /* Fast non-blocking poll: check highest pending fence first (resolves whole pipeline in 1 call),
+             * then lowest pending point if pipeline still has in-flight tail. */
+            uint32_t hi_grp = 0, lo_grp = 0;
+            uint64_t hi_seq = 0, lo_seq = 0, hi_pt = 0, lo_pt = UINT64_MAX;
+            bool has_hi = false, has_lo = false;
+            for (uint32_t k = 0; k < g_syncs[h].pending_count; ++k) {
+                const struct darwin_sync_pending *e = &g_syncs[h].pending[k];
+                if (e->done) continue;
+                if (!has_hi || e->point > hi_pt) {
+                    has_hi = true; hi_pt = e->point; hi_grp = e->group; hi_seq = e->fence_seq;
+                }
+                if (!has_lo || e->point < lo_pt) {
+                    has_lo = true; lo_pt = e->point; lo_grp = e->group; lo_seq = e->fence_seq;
                 }
             }
-            points[i] = g_syncs[h].signaled_point;
-        } else {
-            points[i] = 0;
+            if (has_hi) {
+                pthread_mutex_unlock(&g_lock);
+                int rc = wait_group_fence(conn, hi_grp, hi_seq, 0);
+                pthread_mutex_lock(&g_lock);
+                if (rc == 0) {
+                    syncobj_mark_group_seq_done_locked(hi_grp, hi_seq);
+                    pthread_cond_broadcast(&g_sync_cond);
+                } else if (has_lo && (lo_grp != hi_grp || lo_seq != hi_seq)) {
+                    pthread_mutex_unlock(&g_lock);
+                    int rc2 = wait_group_fence(conn, lo_grp, lo_seq, 0);
+                    pthread_mutex_lock(&g_lock);
+                    if (rc2 == 0) {
+                        syncobj_mark_group_seq_done_locked(lo_grp, lo_seq);
+                        pthread_cond_broadcast(&g_sync_cond);
+                    }
+                }
+            }
         }
+        points[i] = g_syncs[h].in_use ? g_syncs[h].signaled_point : 0;
     }
     pthread_mutex_unlock(&g_lock);
     return 0;
@@ -432,49 +647,181 @@ int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle
 int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points,
                            unsigned num_handles, int64_t timeout_nsec,
                            unsigned flags, uint32_t *first_signaled) {
+    if (num_handles == 0) return 0;
     io_connect_t conn = fd_to_conn(fd);
-    bool wait_all = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) != 0;
-    for (unsigned i = 0; i < num_handles; ++i) {
-        uint32_t h = handles[i];
-        uint64_t target = points ? points[i] : 1;
-        pthread_mutex_lock(&g_lock);
-        if (h == 0 || h >= MAX_DARWIN_SYNCOBJ || !g_syncs[h].in_use) {
+    bool wait_all        = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) != 0;
+    bool wait_for_submit = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) != 0;
+    bool wait_available  = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) != 0;
+    bool poll_only       = (timeout_nsec <= 0);
+    bool infinite        = (timeout_nsec >= INT64_MAX - 1000000000LL);
+
+    if (wait_all || num_handles == 1) {
+        for (unsigned i = 0; i < num_handles; ++i) {
+            uint32_t h = handles[i];
+            uint64_t target = (points && points[i] != 0) ? points[i] : 1;
+            pthread_mutex_lock(&g_lock);
+            for (;;) {
+                if (h == 0 || h >= MAX_DARWIN_SYNCOBJ || !g_syncs[h].in_use) {
+                    pthread_mutex_unlock(&g_lock);
+                    errno = ENOENT;
+                    return -1;
+                }
+                if (g_syncs[h].signaled_point >= target) break;
+                if (wait_available && syncobj_has_point_available_locked(&g_syncs[h], target)) break;
+
+                uint32_t grp = 0;
+                uint64_t seq = 0;
+                bool has_fence = syncobj_find_wait_fence_locked(&g_syncs[h], target, &grp, &seq);
+                if (has_fence && conn != MACH_PORT_NULL) {
+                    int64_t rel_ns = 0;
+                    if (poll_only) {
+                        rel_ns = 0;
+                    } else if (infinite) {
+                        rel_ns = 10000000000LL;
+                    } else {
+                        int64_t rem = timeout_nsec - now_mono_ns();
+                        if (rem <= 0) {
+                            pthread_mutex_unlock(&g_lock);
+                            errno = ETIME;
+                            return -1;
+                        }
+                        rel_ns = (rem > 10000000000LL) ? 10000000000LL : rem;
+                    }
+                    pthread_mutex_unlock(&g_lock);
+                    int rc = wait_group_fence(conn, grp, seq, rel_ns);
+                    pthread_mutex_lock(&g_lock);
+                    if (rc == 0) {
+                        syncobj_mark_group_seq_done_locked(grp, seq);
+                        pthread_cond_broadcast(&g_sync_cond);
+                        continue;
+                    }
+                    pthread_mutex_unlock(&g_lock);
+                    errno = ETIME;
+                    return -1;
+                }
+
+                /* Target timeline point has not been submitted yet (wait-before-signal) */
+                if (!wait_for_submit || poll_only) {
+                    pthread_mutex_unlock(&g_lock);
+                    errno = ETIME;
+                    return -1;
+                }
+                if (infinite) {
+                    pthread_cond_wait(&g_sync_cond, &g_lock);
+                } else {
+                    int64_t rem = timeout_nsec - now_mono_ns();
+                    if (rem <= 0) {
+                        pthread_mutex_unlock(&g_lock);
+                        errno = ETIME;
+                        return -1;
+                    }
+                    struct timespec rel = {
+                        .tv_sec = (time_t)(rem / 1000000000LL),
+                        .tv_nsec = (long)(rem % 1000000000LL),
+                    };
+                    (void)pthread_cond_timedwait_relative_np(&g_sync_cond, &g_lock, &rel);
+                }
+            }
             pthread_mutex_unlock(&g_lock);
-            errno = ENOENT;
+        }
+        if (first_signaled) *first_signaled = 0;
+        return 0;
+    }
+
+    /* WAIT_ANY across multiple handles */
+    pthread_mutex_lock(&g_lock);
+    for (;;) {
+        bool any_fence = false;
+        uint32_t best_grp = 0;
+        uint64_t best_seq = UINT64_MAX;
+        for (unsigned i = 0; i < num_handles; ++i) {
+            uint32_t h = handles[i];
+            uint64_t target = (points && points[i] != 0) ? points[i] : 1;
+            if (h == 0 || h >= MAX_DARWIN_SYNCOBJ || !g_syncs[h].in_use) {
+                pthread_mutex_unlock(&g_lock);
+                errno = ENOENT;
+                return -1;
+            }
+            if (g_syncs[h].signaled_point >= target ||
+                (wait_available && syncobj_has_point_available_locked(&g_syncs[h], target))) {
+                if (first_signaled) *first_signaled = i;
+                pthread_mutex_unlock(&g_lock);
+                return 0;
+            }
+            uint32_t grp = 0;
+            uint64_t seq = 0;
+            if (!wait_available && syncobj_find_wait_fence_locked(&g_syncs[h], target, &grp, &seq)) {
+                if (!any_fence || seq < best_seq) {
+                    any_fence = true;
+                    best_grp = grp;
+                    best_seq = seq;
+                }
+            }
+        }
+
+        if (any_fence && conn != MACH_PORT_NULL) {
+            /* Non-blocking poll of all pending handles first */
+            bool progressed = false;
+            for (unsigned i = 0; i < num_handles; ++i) {
+                uint32_t h = handles[i];
+                uint64_t target = (points && points[i] != 0) ? points[i] : 1;
+                uint32_t grp = 0;
+                uint64_t seq = 0;
+                if (h > 0 && h < MAX_DARWIN_SYNCOBJ && g_syncs[h].in_use &&
+                    syncobj_find_wait_fence_locked(&g_syncs[h], target, &grp, &seq)) {
+                    pthread_mutex_unlock(&g_lock);
+                    int rc = wait_group_fence(conn, grp, seq, 0);
+                    pthread_mutex_lock(&g_lock);
+                    if (rc == 0) {
+                        syncobj_mark_group_seq_done_locked(grp, seq);
+                        pthread_cond_broadcast(&g_sync_cond);
+                        progressed = true;
+                        break;
+                    }
+                }
+            }
+            if (progressed) continue;
+        }
+
+        if (poll_only) {
+            pthread_mutex_unlock(&g_lock);
+            errno = ETIME;
             return -1;
         }
-        if (g_syncs[h].signaled_point >= target) {
+        int64_t rem = infinite ? 10000000000LL : (timeout_nsec - now_mono_ns());
+        if (!infinite && rem <= 0) {
             pthread_mutex_unlock(&g_lock);
-            if (!wait_all) {
-                if (first_signaled) *first_signaled = i;
-                return 0;
+            errno = ETIME;
+            return -1;
+        }
+
+        if (any_fence && conn != MACH_PORT_NULL) {
+            int64_t slice = (rem > 8000000LL) ? 8000000LL : rem;
+            pthread_mutex_unlock(&g_lock);
+            int rc = wait_group_fence(conn, best_grp, best_seq, slice);
+            pthread_mutex_lock(&g_lock);
+            if (rc == 0) {
+                syncobj_mark_group_seq_done_locked(best_grp, best_seq);
+                pthread_cond_broadcast(&g_sync_cond);
             }
             continue;
         }
-        if (g_syncs[h].has_pending && conn != MACH_PORT_NULL) {
-            struct darwin_syncobj copy = g_syncs[h];
+
+        if (!wait_for_submit) {
             pthread_mutex_unlock(&g_lock);
-            int rc = wait_syncobj_fence(conn, &copy, timeout_nsec);
-            pthread_mutex_lock(&g_lock);
-            if (rc == 0) {
-                if (copy.signaled_point > g_syncs[h].signaled_point)
-                    g_syncs[h].signaled_point = copy.signaled_point;
-                g_syncs[h].has_pending = false;
-                pthread_mutex_unlock(&g_lock);
-                if (!wait_all) {
-                    if (first_signaled) *first_signaled = i;
-                    return 0;
-                }
-                continue;
-            }
-            pthread_mutex_unlock(&g_lock);
+            errno = ETIME;
             return -1;
         }
-        pthread_mutex_unlock(&g_lock);
-        if (timeout_nsec == 0) { errno = ETIME; return -1; }
+        if (infinite) {
+            pthread_cond_wait(&g_sync_cond, &g_lock);
+        } else {
+            struct timespec rel = {
+                .tv_sec = (time_t)(rem / 1000000000LL),
+                .tv_nsec = (long)(rem % 1000000000LL),
+            };
+            (void)pthread_cond_timedwait_relative_np(&g_sync_cond, &g_lock, &rel);
+        }
     }
-    if (first_signaled) *first_signaled = 0;
-    return 0;
 }
 
 int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
@@ -484,21 +831,60 @@ int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
 
 int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point,
                        uint32_t src_handle, uint64_t src_point, uint32_t flags) {
-    (void)fd; (void)flags; (void)src_point;
+    (void)fd; (void)flags;
     pthread_mutex_lock(&g_lock);
     if (dst_handle > 0 && dst_handle < MAX_DARWIN_SYNCOBJ &&
         src_handle > 0 && src_handle < MAX_DARWIN_SYNCOBJ &&
         g_syncs[dst_handle].in_use && g_syncs[src_handle].in_use) {
-        uint64_t pt = dst_point ? dst_point : 1;
-        if (g_syncs[src_handle].has_pending) {
-            g_syncs[dst_handle].has_pending = true;
-            g_syncs[dst_handle].pending_group = g_syncs[src_handle].pending_group;
-            g_syncs[dst_handle].pending_fence_seq = g_syncs[src_handle].pending_fence_seq;
-            g_syncs[dst_handle].pending_point = pt;
-        } else if (g_syncs[src_handle].signaled_point > 0) {
-            if (pt > g_syncs[dst_handle].signaled_point)
-                g_syncs[dst_handle].signaled_point = pt;
+        struct darwin_syncobj *src = &g_syncs[src_handle];
+        struct darwin_syncobj *dst = &g_syncs[dst_handle];
+        uint64_t dst_pt = dst_point ? dst_point : 1;
+
+        /* Snapshot matching pending entries first so dst == src self-transfer is safe */
+        struct darwin_sync_pending copied[MAX_DARWIN_SYNCOBJ_PENDING];
+        uint32_t ncopied = 0;
+        bool src_signaled = false;
+
+        if (src_point == 0) {
+            for (uint32_t i = 0; i < src->pending_count; ++i) {
+                if (!src->pending[i].done) {
+                    copied[ncopied++] = src->pending[i];
+                }
+            }
+            if (ncopied == 0 && src->signaled_point > 0) src_signaled = true;
+        } else if (src->signaled_point >= src_point) {
+            src_signaled = true;
+        } else {
+            uint64_t best_pt = UINT64_MAX;
+            for (uint32_t i = 0; i < src->pending_count; ++i) {
+                if (!src->pending[i].done && src->pending[i].point >= src_point &&
+                    src->pending[i].point < best_pt) {
+                    best_pt = src->pending[i].point;
+                }
+            }
+            if (best_pt != UINT64_MAX) {
+                for (uint32_t i = 0; i < src->pending_count; ++i) {
+                    if (!src->pending[i].done && src->pending[i].point == best_pt) {
+                        copied[ncopied++] = src->pending[i];
+                    }
+                }
+            }
         }
+
+        if (dst_point == 0 && dst != src) {
+            /* Binary destination replacement */
+            dst->signaled_point = 0;
+            dst->pending_count = 0;
+        }
+        if (ncopied > 0) {
+            for (uint32_t i = 0; i < ncopied; ++i) {
+                syncobj_add_pending_locked(dst, dst_pt, copied[i].group, copied[i].fence_seq);
+            }
+        } else if (src_signaled) {
+            if (dst_pt > dst->signaled_point) dst->signaled_point = dst_pt;
+            syncobj_prune_locked(dst);
+        }
+        pthread_cond_broadcast(&g_sync_cond);
     }
     pthread_mutex_unlock(&g_lock);
     return 0;
@@ -736,6 +1122,22 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
         const struct drm_panthor_vm_bind_op *ops =
             (const struct drm_panthor_vm_bind_op *)(uintptr_t)req->ops.array;
         for (uint32_t i = 0; i < req->ops.count; ++i) {
+            /* Wait on any input syncobjs BEFORE mutating GPU page tables (prevents premature UNMAP faults!) */
+            const struct drm_panthor_sync_op *sops =
+                (const struct drm_panthor_sync_op *)(uintptr_t)ops[i].syncs.array;
+            for (uint32_t s = 0; s < ops[i].syncs.count; ++s) {
+                if ((sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) == 0) {
+                    bool is_tl = (sops[s].flags & DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK) ==
+                                 DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ;
+                    uint64_t pt = is_tl ? sops[s].timeline_value : 1;
+                    if (pt > 0) {
+                        uint32_t sh = sops[s].handle;
+                        int64_t dl = now_mono_ns() + 10000000000LL;
+                        drmSyncobjTimelineWait(fd, &sh, &pt, 1, dl,
+                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+                    }
+                }
+            }
             uint32_t op_type = ops[i].flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
             if (op_type == DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY) {
                 /* Signal any out syncs immediately */
@@ -754,14 +1156,18 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
                 if (call_mali(conn, MALI_SEL_VM_BIND, &in, sizeof(in), NULL, NULL) != 0)
                     return -1;
             }
-            /* Process per-op syncs (signal out syncobjs immediately since VM_BIND is synchronous) */
-            const struct drm_panthor_sync_op *sops =
-                (const struct drm_panthor_sync_op *)(uintptr_t)ops[i].syncs.array;
+            /* Process per-op output syncs (signal immediately since VM_BIND is synchronous) */
             for (uint32_t s = 0; s < ops[i].syncs.count; ++s) {
                 if ((sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) != 0) {
-                    uint64_t pt = sops[s].timeline_value ? sops[s].timeline_value : 1;
+                    bool is_tl = (sops[s].flags & DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK) ==
+                                 DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ;
                     uint32_t sh = sops[s].handle;
-                    drmSyncobjTimelineSignal(fd, &sh, &pt, 1);
+                    if (is_tl) {
+                        uint64_t pt = sops[s].timeline_value;
+                        if (pt > 0) drmSyncobjTimelineSignal(fd, &sh, &pt, 1);
+                    } else {
+                        drmSyncobjSignal(fd, &sh, 1);
+                    }
                 }
             }
         }
@@ -770,21 +1176,64 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
 
     case DRM_IOCTL_PANTHOR_BO_CREATE: {
         struct drm_panthor_bo_create *req = (struct drm_panthor_bo_create *)arg;
-        struct Tb375fcMaliBoCreateIn in = {
-            .size = req->size,
-            .flags = (req->flags & DRM_PANTHOR_BO_NO_MMAP) ? MALI_BO_NO_MMAP : 0,
-            .exclusive_vm_id = req->exclusive_vm_id,
-        };
-        struct Tb375fcMaliBoCreateOut out = {0};
-        size_t osz = sizeof(out);
-        if (call_mali(conn, MALI_SEL_BO_CREATE, &in, sizeof(in), &out, &osz) != 0) return -1;
-        if (out.bo_handle > 0 && out.bo_handle < MAX_DARWIN_HOST_BOS) {
-            pthread_mutex_lock(&g_lock);
-            g_mmap_cached[out.bo_handle] = (out.pad != 0);
-            pthread_mutex_unlock(&g_lock);
+        bool no_mmap = (req->flags & DRM_PANTHOR_BO_NO_MMAP) != 0;
+        uint64_t aligned_sz = (req->size + 4095ULL) & ~4095ULL;
+        if (aligned_sz == 0) { errno = EINVAL; return -1; }
+
+        /* With 512 MiB kmem_io, mappable BOs up to 16 MiB (WindowServer m2v 16 MiB slab + PanVK
+         * sync/cs/desc/shader BOs) use hardware WriteCombine kIOMemoryKernelUserShared (kernel
+         * caps WS <= 16 MiB / 48 MiB, non-WS <= 1 MiB / 4 MiB, global <= 64 MiB out of 512 MiB
+         * kmem_io), dropping WindowServer submit flush from ~450 us (m=23 MB) to ~5-50 us! */
+        if (no_mmap || aligned_sz <= (16ULL << 20)) {
+            struct Tb375fcMaliBoCreateIn in = {
+                .size = aligned_sz,
+                .flags = no_mmap ? MALI_BO_NO_MMAP : 0,
+                .exclusive_vm_id = req->exclusive_vm_id,
+            };
+            struct Tb375fcMaliBoCreateOut out = {0};
+            size_t osz = sizeof(out);
+            if (call_mali(conn, MALI_SEL_BO_CREATE, &in, sizeof(in), &out, &osz) == 0) {
+                if (out.bo_handle > 0 && out.bo_handle < MAX_DARWIN_HOST_BOS) {
+                    pthread_mutex_lock(&g_bo_lock);
+                    g_mmap_cached[out.bo_handle] = (out.pad != 0);
+                    note_bo_handle_locked(out.bo_handle);
+                    pthread_mutex_unlock(&g_bo_lock);
+                }
+                req->handle = out.bo_handle;
+                req->size = out.size;
+                return 0;
+            }
+            if (no_mmap) return -1;
+            /* Mappable BO exceeded kernel WC budget -> fall through to anon mmap + BO_IMPORT_HOST */
         }
-        req->handle = out.bo_handle;
-        req->size = out.size;
+
+        void *ap = mmap(NULL, (size_t)aligned_sz, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (ap == MAP_FAILED) { errno = ENOMEM; return -1; }
+        struct Tb375fcMaliBoImportHostIn hin;
+        memset(&hin, 0, sizeof(hin));
+        hin.host_ptr = (uint64_t)(uintptr_t)ap;
+        hin.size = aligned_sz;
+        hin.exclusive_vm_id = req->exclusive_vm_id;
+        struct Tb375fcMaliBoCreateOut hout = {0};
+        size_t hosz = sizeof(hout);
+        if (call_mali(conn, MALI_SEL_BO_IMPORT_HOST, &hin, sizeof(hin), &hout, &hosz) != 0) {
+            munmap(ap, (size_t)aligned_sz);
+            return -1;
+        }
+        /* Flush initial wired zero-fill pages to DRAM immediately so GPU never sees stale lines.
+         * Do NOT register in g_mmap_bos[] until panthor_darwin_mmap_bo() is actually called,
+         * so unmapped Private GPU textures never pay per-submit CPU dc civac overhead! */
+        arm64_dcache_clean_inval(ap, (size_t)aligned_sz);
+        if (hout.bo_handle > 0 && hout.bo_handle < MAX_DARWIN_HOST_BOS) {
+            pthread_mutex_lock(&g_bo_lock);
+            g_anon_bos[hout.bo_handle].ptr = ap;
+            g_anon_bos[hout.bo_handle].size = (size_t)aligned_sz;
+            g_anon_map_cnt[hout.bo_handle] = 0;
+            note_bo_handle_locked(hout.bo_handle);
+            pthread_mutex_unlock(&g_bo_lock);
+        }
+        req->handle = hout.bo_handle;
+        req->size = hout.size;
         return 0;
     }
 
@@ -796,17 +1245,28 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
 
     case DRM_IOCTL_GEM_CLOSE: {
         struct drm_gem_close *req = (struct drm_gem_close *)arg;
+        void *anon_ptr = NULL;
+        size_t anon_sz = 0;
         if (req->handle > 0 && req->handle < MAX_DARWIN_HOST_BOS) {
-            pthread_mutex_lock(&g_lock);
+            pthread_mutex_lock(&g_bo_lock);
             g_host_bos[req->handle].ptr = NULL;
             g_host_bos[req->handle].size = 0;
             g_mmap_bos[req->handle].ptr = NULL;
             g_mmap_bos[req->handle].size = 0;
+            anon_ptr = g_anon_bos[req->handle].ptr;
+            anon_sz = g_anon_bos[req->handle].size;
+            g_anon_bos[req->handle].ptr = NULL;
+            g_anon_bos[req->handle].size = 0;
+            g_anon_map_cnt[req->handle] = 0;
             g_mmap_cached[req->handle] = false;
-            pthread_mutex_unlock(&g_lock);
+            pthread_mutex_unlock(&g_bo_lock);
         }
         struct Tb375fcMaliHandleIn in = { .handle = req->handle, .pad = 0 };
-        return call_mali(conn, MALI_SEL_BO_DESTROY, &in, sizeof(in), NULL, NULL);
+        int rc = call_mali(conn, MALI_SEL_BO_DESTROY, &in, sizeof(in), NULL, NULL);
+        if (anon_ptr && anon_sz > 0) {
+            munmap(anon_ptr, anon_sz);
+        }
+        return rc;
     }
 
     case DRM_IOCTL_PANTHOR_BO_QUERY_INFO: {
@@ -884,15 +1344,21 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
         const struct drm_panthor_queue_submit *qsubs =
             (const struct drm_panthor_queue_submit *)(uintptr_t)req->queue_submits.array;
 
-        /* Wait for any input syncobjs first */
+        /* Wait for any input syncobjs first (using absolute CLOCK_MONOTONIC deadline) */
         for (uint32_t i = 0; i < req->queue_submits.count; ++i) {
             const struct drm_panthor_sync_op *sops =
                 (const struct drm_panthor_sync_op *)(uintptr_t)qsubs[i].syncs.array;
             for (uint32_t s = 0; s < qsubs[i].syncs.count; ++s) {
                 if ((sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) == 0) {
-                    uint32_t sh = sops[s].handle;
-                    uint64_t pt = sops[s].timeline_value ? sops[s].timeline_value : 1;
-                    drmSyncobjTimelineWait(fd, &sh, &pt, 1, 10000000000LL, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+                    bool is_tl = (sops[s].flags & DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK) ==
+                                 DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ;
+                    uint64_t pt = is_tl ? sops[s].timeline_value : 1;
+                    if (pt > 0) {
+                        uint32_t sh = sops[s].handle;
+                        int64_t dl = now_mono_ns() + 10000000000LL;
+                        drmSyncobjTimelineWait(fd, &sh, &pt, 1, dl,
+                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+                    }
                 }
             }
         }
@@ -900,9 +1366,9 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
         struct timespec ts0, ts1, ts2;
         clock_gettime(CLOCK_MONOTONIC, &ts0);
         size_t hkb = 0, mkb = 0;
-        pthread_mutex_lock(&g_lock);
+        pthread_mutex_lock(&g_bo_lock);
         flush_all_host_bos(false, &hkb, &mkb);
-        pthread_mutex_unlock(&g_lock);
+        pthread_mutex_unlock(&g_bo_lock);
         clock_gettime(CLOCK_MONOTONIC, &ts1);
 
         struct Tb375fcMaliGroupSubmitOut out = {0};
@@ -933,35 +1399,48 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
         }
         clock_gettime(CLOCK_MONOTONIC, &ts2);
         static uint32_t sSubLog = 0;
-        if (++sSubLog <= 25) {
-            long fUs = (ts1.tv_sec - ts0.tv_sec) * 1000000L + (ts1.tv_nsec - ts0.tv_nsec) / 1000L;
-            long iUs = (ts2.tv_sec - ts1.tv_sec) * 1000000L + (ts2.tv_nsec - ts1.tv_nsec) / 1000L;
-            static int sConFd = -2;
-            if (sConFd == -2) sConFd = open("/dev/console", O_WRONLY | O_NOCTTY);
-            char msg[160];
-            int n = snprintf(msg, sizeof(msg), "[panvk] submit #%u flush=%ldus (h=%zuKB m=%zuKB) ioctl=%ldus q=%u\n",
-                             sSubLog, fUs, hkb, mkb, iUs, total);
-            if (sConFd >= 0 && n > 0) (void)write(sConFd, msg, (size_t)n);
+        static uint32_t sSlowLog = 0;
+        long fUs = (ts1.tv_sec - ts0.tv_sec) * 1000000L + (ts1.tv_nsec - ts0.tv_nsec) / 1000L;
+        long iUs = (ts2.tv_sec - ts1.tv_sec) * 1000000L + (ts2.tv_nsec - ts1.tv_nsec) / 1000L;
+        uint32_t subNo = ++sSubLog;
+        if (subNo <= 12 || (fUs > 15000L && ++sSlowLog <= 16)) {
+            struct Tb375fcMaliDebugLogIn dlog;
+            memset(&dlog, 0, sizeof(dlog));
+            snprintf(dlog.msg, sizeof(dlog.msg) - 1, "[panvk:%s] submit #%u flush=%ldus (h=%zuKB m=%zuKB) ioctl=%ldus q=%u",
+                     getprogname(), subNo, fUs, hkb, mkb, iUs, total);
+            (void)call_mali(conn, MALI_SEL_DEBUG_LOG, &dlog, sizeof(dlog), NULL, NULL);
         }
 
-        /* Attach fence_seq to all output syncobjs */
+        /* Attach fence_seq to all output syncobjs and wake any wait-before-signal waiters */
         pthread_mutex_lock(&g_lock);
+        bool signaled_any = false;
         for (uint32_t i = 0; i < req->queue_submits.count; ++i) {
             const struct drm_panthor_sync_op *sops =
                 (const struct drm_panthor_sync_op *)(uintptr_t)qsubs[i].syncs.array;
             for (uint32_t s = 0; s < qsubs[i].syncs.count; ++s) {
                 if ((sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) != 0) {
                     uint32_t sh = sops[s].handle;
-                    uint64_t pt = sops[s].timeline_value ? sops[s].timeline_value : 1;
+                    bool is_tl = (sops[s].flags & DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK) ==
+                                 DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ;
                     if (sh > 0 && sh < MAX_DARWIN_SYNCOBJ && g_syncs[sh].in_use) {
-                        g_syncs[sh].has_pending = true;
-                        g_syncs[sh].pending_group = req->group_handle;
-                        g_syncs[sh].pending_fence_seq = out.fence_seq;
-                        g_syncs[sh].pending_point = pt;
+                        if (is_tl) {
+                            uint64_t pt = sops[s].timeline_value;
+                            if (pt > 0) {
+                                syncobj_add_pending_locked(&g_syncs[sh], pt, req->group_handle, out.fence_seq);
+                                signaled_any = true;
+                            }
+                        } else {
+                            /* Binary syncobj: replace any previous fence with the new pending GPU fence */
+                            g_syncs[sh].signaled_point = 0;
+                            g_syncs[sh].pending_count = 0;
+                            syncobj_add_pending_locked(&g_syncs[sh], 1, req->group_handle, out.fence_seq);
+                            signaled_any = true;
+                        }
                     }
                 }
             }
         }
+        if (signaled_any) pthread_cond_broadcast(&g_sync_cond);
         pthread_mutex_unlock(&g_lock);
         return 0;
     }

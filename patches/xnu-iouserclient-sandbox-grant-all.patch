@@ -1,0 +1,9 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -1,5 +1,8 @@
+ native_sandbox_grant(IOService * service)
+ {
++	if (service->getProperty("NativeSandboxGrantAll") == kOSBooleanTrue) {
++		return true;
++	}
+ 	OSString * list = OSDynamicCast(OSString, service->getProperty("NativeSandboxGrantProcess"));

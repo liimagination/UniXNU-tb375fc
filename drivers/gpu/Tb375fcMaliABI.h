@@ -29,7 +29,12 @@ enum Tb375fcMaliSelector {
     MALI_SEL_GROUP_SUBMIT       = 11, /* in:  Tb375fcMaliGroupSubmitIn, out: Tb375fcMaliGroupSubmitOut */
     MALI_SEL_FENCE_WAIT         = 12, /* in:  Tb375fcMaliFenceWaitIn, out: Tb375fcMaliFenceWaitOut */
     MALI_SEL_GROUP_GET_STATE    = 13, /* in:  Tb375fcMaliHandleIn, out: Tb375fcMaliGroupStateOut */
-    MALI_SEL_COUNT              = 14
+    MALI_SEL_DEBUG_LOG          = 14, /* in:  Tb375fcMaliDebugLogIn */
+    MALI_SEL_COUNT              = 15
+};
+
+struct Tb375fcMaliDebugLogIn {
+    char msg[192];
 };
 
 /* Mirrors Linux drm_panthor_gpu_info + drm_panthor_csif_info + drm_panthor_timestamp_info */
@@ -179,7 +184,7 @@ struct Tb375fcMaliQueueSubmitDesc {
     uint32_t pad;
 };
 
-#define MALI_MAX_SUBMITS_PER_CALL 8u
+#define MALI_MAX_SUBMITS_PER_CALL 64u
 
 struct Tb375fcMaliGroupSubmitIn {
     uint32_t group_handle;

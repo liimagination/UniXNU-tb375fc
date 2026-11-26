@@ -1,0 +1,106 @@
+diff --git a/crates/metal2vulkan-runtime/src/floor.rs b/crates/metal2vulkan-runtime/src/floor.rs
+index f907ed1..5bdd350 100644
+--- a/crates/metal2vulkan-runtime/src/floor.rs
++++ b/crates/metal2vulkan-runtime/src/floor.rs
+@@ -547,9 +547,6 @@ pub(crate) const REQUIRED: &[Feature] = &[
+     // An image access out of range: a write or an atomic is dropped and a read answers zero, as
+     // Metal's, with no guard in the shader. Vulkan 1.3's.
+     feature!(vulkan13.robust_image_access => RobustImageAccess),
+-    // An image read out of range answers Metal's texel exactly, alpha 1 for a format without
+-    // alpha, a fetch past the view's levels included, so a read takes no check in the shader.
+-    feature!(robustness2.robust_image_access2 => RobustImageAccess2),
+     // A render pipeline's color attachments blend each by its own state, as Metal's do, and a
+     // fragment function writes and atomically updates device memory, as Metal's may. Vulkan 1.4
+     // requires both of every graphics device.
+@@ -582,26 +579,6 @@ pub(crate) const REQUIRED: &[Feature] = &[
+     // The depth clip mode `Clamp` (`setDepthClipMode:`), a pipeline's depth clamp, the device's
+     // own. Vulkan 1.4 and Roadmap 2022 require it of every device.
+     feature!(core.depth_clamp => DepthClamp),
+-    // A vertex or post-tessellation vertex function's `[[clip_distance]]`, the device's own
+-    // clipping. Every floor driver reports it.
+-    feature!(core.shader_clip_distance => ShaderClipDistance),
+-    // A render pipeline of a post-tessellation vertex function draws its patches through the
+-    // device's tessellator: a synthesized control stage reads each patch's factors through their
+-    // address, and the function is the evaluation stage. A device without it is below the floor.
+-    feature!(core.tessellation_shader => TessellationShader),
+-    // A post-tessellation vertex function's `[[point_size]]`, which a point draw of its patches
+-    // takes. Without it the device draws every such point at size 1. Every floor driver reports
+-    // it.
+-    feature!(core.shader_tessellation_and_geometry_point_size => ShaderTessellationAndGeometryPointSize),
+-    // A vertex function's `[[render_target_array_index]]` in a layered pass: one form, its `Layer`
+-    // output (written 0 for an index at or past the pass's length), in every pass. Every venue's
+-    // driver reports it.
+-    feature!(vulkan12.shader_output_layer => ShaderOutputLayer),
+-    // Several viewports and scissors (`setViewports:count:`), and a vertex function's
+-    // `[[viewport_array_index]]`: one form, its `ViewportIndex` output (written 0 for an index at
+-    // or past the encoder's viewport count). Every venue's driver reports both.
+-    feature!(core.multi_viewport => MultiViewport),
+-    feature!(vulkan12.shader_output_viewport_index => ShaderOutputViewportIndex),
+     // A point drawn at the size its vertex function writes, up to the device's `pointSizeRange`:
+     // without it a device draws only points of size 1.0. Vulkan 1.4 and Roadmap 2022 require it
+     // of every device.
+@@ -613,9 +590,6 @@ pub(crate) const REQUIRED: &[Feature] = &[
+     // A fragment function that reads its `[[sample_id]]`, or an interpolant at a sample, runs once
+     // per covered sample, as Metal runs it. Vulkan 1.4 and Roadmap 2022 require it of every device.
+     feature!(core.sample_rate_shading => SampleRateShading),
+-    // A vertex or post-tessellation vertex function writes and atomically updates device memory,
+-    // as Metal's may. A device without it is below the floor.
+-    feature!(core.vertex_pipeline_stores_and_atomics => VertexPipelineStoresAndAtomics),
+     // A `Counting` visibility result is the count of samples that passed: a precise occlusion
+     // query's, which `Boolean` takes too. Roadmap 2022 requires it of every device, and every
+     // venue's driver reports it.
+@@ -680,6 +654,15 @@ pub(crate) const OPTIONAL: &[Feature] = &[
+     // the device offers it, else a branch over the offset's values, each with its value as
+     // `ConstOffset` (Vulkan 1.0's).
+     feature!(maintenance8.maintenance8 => Maintenance8),
++    // PanVK Valhall v10/v11 optional features (enabled when supported by driver):
++    feature!(robustness2.robust_image_access2 => RobustImageAccess2),
++    feature!(core.shader_clip_distance => ShaderClipDistance),
++    feature!(core.tessellation_shader => TessellationShader),
++    feature!(core.shader_tessellation_and_geometry_point_size => ShaderTessellationAndGeometryPointSize),
++    feature!(vulkan12.shader_output_layer => ShaderOutputLayer),
++    feature!(core.multi_viewport => MultiViewport),
++    feature!(vulkan12.shader_output_viewport_index => ShaderOutputViewportIndex),
++    feature!(core.vertex_pipeline_stores_and_atomics => VertexPipelineStoresAndAtomics),
+ ];
+ 
+ /// The feature of the attachment feedback loop ([`ATTACHMENT_READ_EXTENSIONS`]): enabled where the
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 0d1bdc8..eade1b3 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -38,7 +38,7 @@ use std::time::Duration;
+ /// 4.1 ms at the median and up to 19 ms, and 256 MiB for 93 ms at the median and up to 242 ms. So
+ /// allocations are short, and a take longer than one pays its own length
+ /// once: the allocation it makes, a long allocation, serves later takes of that length.
+-const ALLOCATION_LEN: u64 = 16 << 20;
++const ALLOCATION_LEN: u64 = 2 << 20;
+ 
+ /// A block's length, and its first byte's offset in its allocation, are multiples of this, or of
+ /// the device's `bufferImageGranularity` where that is larger: no block shares a page of that
+diff --git a/crates/metal2vulkan-runtime/src/ring.rs b/crates/metal2vulkan-runtime/src/ring.rs
+index b95dfd7..9ed863c 100644
+--- a/crates/metal2vulkan-runtime/src/ring.rs
++++ b/crates/metal2vulkan-runtime/src/ring.rs
+@@ -49,7 +49,7 @@ use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+ /// A chunk's length: the most one write takes.
+ pub(crate) const CHUNK: u64 = 64 * 1024;
+ /// A ring block's length.
+-pub(crate) const BLOCK: u64 = 32 * CHUNK;
++pub(crate) const BLOCK: u64 = 8 * CHUNK;
+ /// The chunks of a block: a take that leaves fewer free asks the block-maker thread for the
+ /// next block.
+ pub(crate) const SPARE: usize = (BLOCK / CHUNK) as usize;
+diff --git a/crates/metal2vulkan-runtime/src/staging.rs b/crates/metal2vulkan-runtime/src/staging.rs
+index 22294ef..9621899 100644
+--- a/crates/metal2vulkan-runtime/src/staging.rs
++++ b/crates/metal2vulkan-runtime/src/staging.rs
+@@ -29,7 +29,7 @@ use std::sync::Arc;
+ pub(crate) const SPAN_ALIGN: u64 = 256;
+ 
+ /// The staging region's bytes.
+-pub(crate) const REGION_LEN: u64 = 16 << 20;
++pub(crate) const REGION_LEN: u64 = 2 << 20;
+ 
+ /// The ring's arithmetic: its spans, oldest first, each with the progress value at which it is
+ /// free.

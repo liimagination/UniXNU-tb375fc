@@ -1,0 +1,47 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1373,10 +1373,9 @@
+   out->samples=1;
+   if(out->type==MTLTextureType2DMultisample)out->type=MTLTextureType2D;
+   if(out->type==MTLTextureType2DMultisampleArray)out->type=MTLTextureType2DArray;
+-  // A preserved attachment may be copied to its resolve target after the pass.
+-  if((out->options&MTLResourceStorageModeMask)==MTLResourceStorageModeMemoryless)
+-   out->options=(out->options&~MTLResourceStorageModeMask)|MTLResourceStorageModePrivate;
+  }
++ if((out->options&MTLResourceStorageModeMask)==MTLResourceStorageModeMemoryless)
++  out->options=(out->options&~MTLResourceStorageModeMask)|MTLResourceStorageModePrivate;
+  if(isPvrtc(out->format)) {
+   static std::atomic<bool> told;
+   if(!told.exchange(true)){const char *note="native-metal: PVRTC textures are made RGBA8 and decoded on the CPU\n";(void)!write(2,note,strlen(note));}
+@@ -4885,8 +4884,30 @@
+  }
+  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal library unreadable: %{public}s open errno %d:%{public}s",full,openErrno,walk.c_str());
+ }
+-- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
++static NSData *nbReadLibraryFile(NSString *path, NSError **error) {
+  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;
++ if(bytes && bytes.length>0)return bytes;
++ if(!path)return nil;
++ const int fd=open(path.fileSystemRepresentation,O_RDONLY);
++ if(fd<0)return nil;
++ struct stat st={};
++ if(fstat(fd,&st)!=0 || st.st_size<=0){close(fd);return nil;}
++ NSMutableData *buf=[NSMutableData dataWithLength:(NSUInteger)st.st_size];
++ if(!buf){close(fd);return nil;}
++ uint8_t *dst=(uint8_t *)buf.mutableBytes;
++ off_t off=0;
++ while(off<st.st_size){
++  size_t want=(size_t)MIN((off_t)(1<<20),st.st_size-off);
++  ssize_t got=pread(fd,dst+off,want,off);
++  if(got<=0){close(fd);return nil;}
++  off+=got;
++ }
++ close(fd);
++ if(error)*error=nil;
++ return buf;
++}
++- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
++ NSData *bytes=nbReadLibraryFile(path,error);
+  if(!bytes){if(path)reportUnreadableLibrary(path);return nil;}
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
