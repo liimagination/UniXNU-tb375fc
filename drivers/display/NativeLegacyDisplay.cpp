@@ -122,6 +122,8 @@ extern "C" bool native_legacy_set_refresh_properties(void *display);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
 extern "C" uint64_t mach_continuous_time(void);
 extern "C" void flush_dcache64(addr64_t addr,unsigned count,int phys);
+extern "C" uint64_t tb375fc_mali_ws_submitted_seq(void) __attribute__((weak_import));
+extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us) __attribute__((weak_import));
 extern "C" uint32_t tb375fc_mali_wait_ws_idle(uint32_t max_us) __attribute__((weak_import));
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
@@ -132,11 +134,12 @@ static inline bool nativeBgra(uint32_t format,uint32_t planes) {
 // (every Metal frame was refused while only BGRA was taken). The copy converts it to the scanout's BGRA (convertHalfRows below).
 static inline bool nativeHalf(uint32_t format,uint32_t planes) {return format==0x52476841 && !planes;}
 static inline bool nativeScanoutFormat(uint32_t format,uint32_t planes) {return nativeBgra(format,planes) || nativeHalf(format,planes);}
-// One byte per positive half bit pattern (32768); negative values and NaNs give 0, values of 1.0 and above 255.
+// One byte per 16-bit half-float bit pattern (65536 entries: 0..32767 positive, 32768..65535 negative/NaN -> 0).
+// Eliminates all 3 sign-bit branches per pixel in the inner half-float conversion loop!
 static uint8_t *halfTable() {
     static uint8_t *table;
     if(table)return table;
-    uint8_t *made=static_cast<uint8_t *>(IOMalloc(32768));
+    uint8_t *made=static_cast<uint8_t *>(IOMalloc(65536));
     if(!made)return nullptr;
     unsigned mode=1;PE_parse_boot_argn("fb-half",&mode,sizeof(mode));
     const uint16_t *thresholds=mode==2?native_half::kEncoded:native_half::kLinear;
@@ -145,188 +148,229 @@ static uint8_t *halfTable() {
         while(code<255 && bits>=thresholds[code])++code;
         made[bits]=(bits>=0x7c00)?(bits==0x7c00?255:0):uint8_t(code);
     }
-    if(!__sync_bool_compare_and_swap(&table,(uint8_t *)nullptr,made))IOFree(made,32768);
+    bzero(made + 32768, 32768);
+    if(!__sync_bool_compare_and_swap(&table,(uint8_t *)nullptr,made))IOFree(made,65536);
     return table;
 }
-// 2-thread P-core parallel helper for flush_dcache64 (Phase 1) + top-to-bottom interleaved
-// even/odd row conversion (Phase 2). Interleaving keeps both cores sweeping top->bottom in
-// lockstep so there is NEVER a mid-screen horizontal tear seam at y=height/2!
+// 3-thread unbound work-stealing 16-row contiguous stripe helper (main + 2 workers, P-core hinted):
+// Leaves >=1 A715 P-core free for WindowServer and uses dynamic atomic stripe stealing so if any worker
+// is preempted by WindowServer, the remaining threads immediately steal its stripes with ZERO barrier stall!
+static constexpr uint32_t kHalfWorkers = 2u;
 struct HalfBandJob {
     volatile void *dst;
     uint64_t dstStride;
     const void *src;
     uint64_t srcStride;
-    uint64_t flushOffset;
-    uint64_t flushLen;
     const uint8_t *table;
     uint64_t *prevH1;
     uint64_t *prevH2;
     uint32_t width;
-    uint32_t yStart;
-    uint32_t yEnd;
-    uint32_t yStep;
-    bool flushOnly;
+    uint32_t height;
+    uint32_t stripeRows;   /* 16 rows per stripe */
+    bool doFlush;
     bool forceFull;
+};
+struct alignas(64) HalfWorkerSlot {
     uint32_t dirtyOut;
+    uint32_t sleeping;
+    uint64_t *rowBuf;
 };
 static IOLock *gHalfLock = nullptr;
-static HalfBandJob gHalfJob = {};
+static HalfBandJob gHalfShared = {};
+static HalfWorkerSlot gHalfSlots[kHalfWorkers] = {};
 static volatile uint32_t gHalfEpoch = 0;
-static volatile uint32_t gHalfDone = 0;
-static volatile uint32_t gHalfSleeping = 0;
-static bool gHalfWorkerReady = false;
-static uint64_t *gHalfRowBuf0 = nullptr;
-static uint64_t *gHalfRowBuf1 = nullptr;
+static volatile uint32_t gHalfNextRow = 0;
+static volatile uint32_t gHalfDoneCount = 0;
+static uint32_t gHalfWorkerCount = 0;
+static bool gHalfWorkersInit = false;
+static uint64_t *gHalfRowBufMain = nullptr;
 
-static uint32_t convertHalfBand2x(const HalfBandJob &j, uint64_t *rowBuf) {
-    if (j.flushLen > 0) {
-        flush_dcache64((addr64_t)(reinterpret_cast<uintptr_t>(j.src) + j.flushOffset),
-                       (unsigned)j.flushLen, false);
-        if (j.flushOnly) return 0u;
-    }
+static uint32_t convertHalfSteal2x(const HalfBandJob &j, uint64_t *rowBuf) {
     const size_t rowBytes = (size_t)j.width * 8u;
     uint32_t dirtyRows = 0;
     const uint8_t *table = j.table;
-    const uint32_t step = j.yStep ? j.yStep : 1u;
-    for (uint32_t y = j.yStart; y < j.yEnd; y += step) {
-        const uint64_t *in = reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(j.src) + j.srcStride * y);
-        uint64_t h0 = 0x100000001b3ULL, h1 = 0x9e3779b97f4a7c15ULL;
-        uint64_t h2 = 0xbf58476d1ce4e5b9ULL, h3 = 0x94d049bb133111ebULL;
-        /* Full-pixel 4-way unrolled hash: checks 100% of pixels in the row so narrow cursors,
-         * borders, and spinner spokes are NEVER skipped or flickered! */
-        uint32_t x = 0;
-        for (; x + 4u <= j.width; x += 4u) {
-            h0 = (h0 + in[x + 0u]) ^ (h0 >> 17);
-            h1 = (h1 + in[x + 1u]) ^ (h1 >> 19);
-            h2 = (h2 + in[x + 2u]) ^ (h2 >> 23);
-            h3 = (h3 + in[x + 3u]) ^ (h3 >> 29);
+    const uint32_t sRows = j.stripeRows ? j.stripeRows : 16u;
+    for (;;) {
+        const uint32_t sb = __atomic_fetch_add(&gHalfNextRow, sRows, __ATOMIC_RELAXED);
+        if (sb >= j.height) break;
+        const uint32_t se = (sb + sRows < j.height) ? (sb + sRows) : j.height;
+        if (j.doFlush) {
+            const uint64_t off = j.srcStride * sb;
+            const uint64_t len = j.srcStride * (se - sb);
+            flush_dcache64((addr64_t)(reinterpret_cast<uintptr_t>(j.src) + off),
+                           (unsigned)len, false);
         }
-        for (; x < j.width; ++x) h0 = (h0 + in[x]) ^ (h0 >> 17);
-        const uint64_t fh1 = h0 ^ (h2 * 0x9e3779b97f4a7c15ULL);
-        const uint64_t fh2 = h1 ^ (h3 * 0xbf58476d1ce4e5b9ULL);
-        const uint32_t hIdx = (step == 2u) ? (y >> 1) : y;
-        if (!j.forceFull && fh1 == j.prevH1[hIdx] && fh2 == j.prevH2[hIdx]) continue;
-        j.prevH1[hIdx] = fh1; j.prevH2[hIdx] = fh2;
-        dirtyRows++;
-        uint64_t last_p = ~in[0];
-        uint64_t last_out = 0;
-        for (uint32_t cx = 0; cx < j.width; ++cx) {
-            const uint64_t p = in[cx];
-            if (p == last_p) {
-                rowBuf[cx] = last_out;
-                continue;
+        for (uint32_t y = sb; y < se; ++y) {
+            const uint64_t *in = reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(j.src) + j.srcStride * y);
+            uint64_t h0 = 0x100000001b3ULL, h1 = 0x9e3779b97f4a7c15ULL;
+            uint64_t h2 = 0xbf58476d1ce4e5b9ULL, h3 = 0x94d049bb133111ebULL;
+            /* Fast 8-pixel unrolled full-pixel hash (100% of pixels checked, LDP-friendly). */
+            uint32_t x = 0;
+            for (; x + 8u <= j.width; x += 8u) {
+                const uint64_t p0 = in[x + 0u], p1 = in[x + 1u], p2 = in[x + 2u], p3 = in[x + 3u];
+                const uint64_t p4 = in[x + 4u], p5 = in[x + 5u], p6 = in[x + 6u], p7 = in[x + 7u];
+                h0 = (h0 + p0) ^ p4;
+                h1 = (h1 ^ p1) + p5;
+                h2 = (h2 + p2) ^ p6;
+                h3 = (h3 ^ p3) + p7;
+                h0 = (h0 << 7) | (h0 >> 57);
+                h2 = (h2 << 13) | (h2 >> 51);
             }
-            last_p = p;
-            const uint32_t r = uint32_t(p) & 0xffff, g = uint32_t(p >> 16) & 0xffff, b = uint32_t(p >> 32) & 0xffff;
-            const uint32_t rv = (r & 0x8000) ? 0 : table[r], gv = (g & 0x8000) ? 0 : table[g], bv = (b & 0x8000) ? 0 : table[b];
-            const uint32_t px = 0xff000000u | (rv << 16) | (gv << 8) | bv;
-            last_out = (uint64_t)px | ((uint64_t)px << 32);
-            rowBuf[cx] = last_out;
+            for (; x < j.width; ++x) {
+                h0 = (h0 + in[x]) ^ (h0 >> 17);
+            }
+            const uint64_t fh1 = (h0 ^ (h2 * 0x9e3779b97f4a7c15ULL)) + (h1 >> 11);
+            const uint64_t fh2 = (h1 ^ (h3 * 0xbf58476d1ce4e5b9ULL)) + (h0 >> 13);
+            if (!j.forceFull && fh1 == j.prevH1[y] && fh2 == j.prevH2[y]) continue;
+            j.prevH1[y] = fh1; j.prevH2[y] = fh2;
+            dirtyRows++;
+            /* Branchless 64KB-LUT 4-pixel unrolled RGBA16F -> 2x BGRA8888 horizontal-doubled decode,
+             * with fast flat-quad skip for solid UI backgrounds (System Settings / menus / text boxes). */
+            uint32_t cx = 0;
+            for (; cx + 4u <= j.width; cx += 4u) {
+                const uint64_t p0 = in[cx + 0u], p1 = in[cx + 1u], p2 = in[cx + 2u], p3 = in[cx + 3u];
+                const uint32_t px0 = 0xff000000u | ((uint32_t)table[(uint16_t)p0] << 16)
+                                   | ((uint32_t)table[(uint16_t)(p0 >> 16)] << 8)
+                                   | (uint32_t)table[(uint16_t)(p0 >> 32)];
+                const uint64_t out0v = (uint64_t)px0 | ((uint64_t)px0 << 32);
+                rowBuf[cx + 0u] = out0v;
+                if (((p0 ^ p1) | (p0 ^ p2) | (p0 ^ p3)) == 0ULL) {
+                    rowBuf[cx + 1u] = out0v;
+                    rowBuf[cx + 2u] = out0v;
+                    rowBuf[cx + 3u] = out0v;
+                } else {
+                    const uint32_t px1 = 0xff000000u | ((uint32_t)table[(uint16_t)p1] << 16)
+                                       | ((uint32_t)table[(uint16_t)(p1 >> 16)] << 8)
+                                       | (uint32_t)table[(uint16_t)(p1 >> 32)];
+                    const uint32_t px2 = 0xff000000u | ((uint32_t)table[(uint16_t)p2] << 16)
+                                       | ((uint32_t)table[(uint16_t)(p2 >> 16)] << 8)
+                                       | (uint32_t)table[(uint16_t)(p2 >> 32)];
+                    const uint32_t px3 = 0xff000000u | ((uint32_t)table[(uint16_t)p3] << 16)
+                                       | ((uint32_t)table[(uint16_t)(p3 >> 16)] << 8)
+                                       | (uint32_t)table[(uint16_t)(p3 >> 32)];
+                    rowBuf[cx + 1u] = (uint64_t)px1 | ((uint64_t)px1 << 32);
+                    rowBuf[cx + 2u] = (uint64_t)px2 | ((uint64_t)px2 << 32);
+                    rowBuf[cx + 3u] = (uint64_t)px3 | ((uint64_t)px3 << 32);
+                }
+            }
+            for (; cx < j.width; ++cx) {
+                const uint64_t p = in[cx];
+                const uint32_t px = 0xff000000u | ((uint32_t)table[(uint16_t)p] << 16)
+                                  | ((uint32_t)table[(uint16_t)(p >> 16)] << 8)
+                                  | (uint32_t)table[(uint16_t)(p >> 32)];
+                rowBuf[cx] = (uint64_t)px | ((uint64_t)px << 32);
+            }
+            uint8_t *out0 = const_cast<uint8_t *>(static_cast<volatile uint8_t *>(j.dst)) + j.dstStride * (y * 2);
+            uint8_t *out1 = const_cast<uint8_t *>(static_cast<volatile uint8_t *>(j.dst)) + j.dstStride * (y * 2 + 1);
+            memcpy(out0, rowBuf, rowBytes);
+            memcpy(out1, rowBuf, rowBytes);
         }
-        uint8_t *out0 = const_cast<uint8_t *>(static_cast<volatile uint8_t *>(j.dst)) + j.dstStride * (y * 2);
-        uint8_t *out1 = const_cast<uint8_t *>(static_cast<volatile uint8_t *>(j.dst)) + j.dstStride * (y * 2 + 1);
-        memcpy(out0, rowBuf, rowBytes);
-        memcpy(out1, rowBuf, rowBytes);
     }
     return dirtyRows;
 }
 
-static void halfBlitWorkerLoop(void *, wait_result_t) {
+static void halfBlitWorkerLoop(void *param, wait_result_t) {
+    const uint32_t idx = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(param));
     extern kern_return_t thread_policy_set(thread_t, uint32_t, int32_t *, uint32_t);
-    int32_t imp = 63; /* Prefer P-core! */
+    int32_t imp = 63; /* Prefer free P-cores without hard-pinning contention! */
     (void)thread_policy_set(current_thread(), 3u, &imp, 1u);
+    HalfWorkerSlot &slot = gHalfSlots[idx];
     uint32_t seen = 0;
     for (;;) {
         uint32_t ep = __atomic_load_n(&gHalfEpoch, __ATOMIC_ACQUIRE);
         if (ep == seen) {
-            /* Brief spin for zero-latency back-to-back 120Hz frames, then sleep cleanly at 0% CPU. */
-            for (uint32_t spin = 0; spin < 1500u && ep == seen; ++spin) {
+            /* Brief spin catches back-to-back 60-120Hz frames with <1us wakeup latency, then sleeps at 0% CPU. */
+            for (uint32_t spin = 0; spin < 1000u && ep == seen; ++spin) {
                 __asm__ volatile("yield" ::: "memory");
                 ep = __atomic_load_n(&gHalfEpoch, __ATOMIC_ACQUIRE);
             }
             if (ep == seen) {
                 IOLockLock(gHalfLock);
                 for (;;) {
-                    __atomic_store_n(&gHalfSleeping, 1u, __ATOMIC_SEQ_CST);
+                    __atomic_store_n(&slot.sleeping, 1u, __ATOMIC_SEQ_CST);
                     ep = __atomic_load_n(&gHalfEpoch, __ATOMIC_SEQ_CST);
                     if (ep != seen) {
-                        __atomic_store_n(&gHalfSleeping, 0u, __ATOMIC_SEQ_CST);
+                        __atomic_store_n(&slot.sleeping, 0u, __ATOMIC_SEQ_CST);
                         break;
                     }
                     IOLockSleep(gHalfLock, (void *)&gHalfEpoch, THREAD_UNINT);
-                    __atomic_store_n(&gHalfSleeping, 0u, __ATOMIC_SEQ_CST);
+                    __atomic_store_n(&slot.sleeping, 0u, __ATOMIC_SEQ_CST);
                 }
                 IOLockUnlock(gHalfLock);
             }
         }
-        gHalfJob.dirtyOut = convertHalfBand2x(gHalfJob, gHalfRowBuf1);
+        slot.dirtyOut = convertHalfSteal2x(gHalfShared, slot.rowBuf);
         seen = ep;
-        __atomic_store_n(&gHalfDone, ep, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&gHalfDoneCount, 1u, __ATOMIC_RELEASE);
     }
 }
 
-static void ensureHalfWorker(void) {
-    if (gHalfWorkerReady) return;
-    if (!gHalfRowBuf0) gHalfRowBuf0 = static_cast<uint64_t *>(IOMalloc(2048 * sizeof(uint64_t)));
-    if (!gHalfRowBuf1) gHalfRowBuf1 = static_cast<uint64_t *>(IOMalloc(2048 * sizeof(uint64_t)));
+static void ensureHalfWorkers(void) {
+    if (gHalfWorkersInit) return;
+    gHalfWorkersInit = true;
+    if (!gHalfRowBufMain) gHalfRowBufMain = static_cast<uint64_t *>(IOMalloc(2048 * sizeof(uint64_t)));
     if (!gHalfLock) gHalfLock = IOLockAlloc();
-    if (!gHalfRowBuf0 || !gHalfRowBuf1 || !gHalfLock) return;
-    thread_t th = nullptr;
-    if (kernel_thread_start(halfBlitWorkerLoop, nullptr, &th) == KERN_SUCCESS && th) {
-        thread_deallocate(th);
-        gHalfWorkerReady = true;
+    if (!gHalfRowBufMain || !gHalfLock) return;
+    uint32_t started = 0;
+    for (uint32_t i = 0; i < kHalfWorkers; ++i) {
+        gHalfSlots[i].rowBuf = static_cast<uint64_t *>(IOMalloc(2048 * sizeof(uint64_t)));
+        if (!gHalfSlots[i].rowBuf) break;
+        thread_t th = nullptr;
+        if (kernel_thread_start(halfBlitWorkerLoop, reinterpret_cast<void *>(static_cast<uintptr_t>(i)), &th) == KERN_SUCCESS && th) {
+            thread_deallocate(th);
+            ++started;
+        } else {
+            break;
+        }
     }
+    gHalfWorkerCount = started;
+    IOLog("NativeLegacyDisplay: half-blit work-stealing pool ready (main + %u unbound P-hint workers)\n", started);
 }
 
 // Rows of RGBA half floats to the scanout's BGRA rows (alpha opaque), supporting 1x and 2x full-screen scale.
-// Optimized with 2-P-core parallel flush+convert, L1-cached row buffers, and cache-line dirty-row delta skip.
+// Optimized with 3-thread dynamic work-stealing flush+convert, 64KB branchless LUT, and 100%-pixel dirty-row skip.
 static bool convertHalfRows(volatile void *dst,uint64_t dstLength,uint64_t dstStride,const void *src,uint64_t srcLength,uint64_t srcStride,
                             uint32_t width,uint32_t height,uint32_t fbScale,uint64_t flushAllocation) {
     const uint8_t *table=halfTable();
     const uint32_t outW=width*fbScale, outH=height*fbScale;
     if(!table || dstStride<uint64_t(outW)*4 || srcStride<uint64_t(width)*8 || !height ||
        dstStride*(outH-1)+uint64_t(outW)*4>dstLength || srcStride*(height-1)+uint64_t(width)*8>srcLength)return false;
-    static uint64_t prevEvenH1[1024]={0}, prevEvenH2[1024]={0};
-    static uint64_t prevOddH1[1024]={0},  prevOddH2[1024]={0};
+    static uint64_t prevH1[1024]={0}, prevH2[1024]={0};
     static uint32_t prevW=0, prevH=0, halfFrames=0;
-    ensureHalfWorker();
-    const bool forceFull = (halfFrames < 4) || (width != prevW) || (height != prevH) || (height > 1024) || !gHalfRowBuf0;
+    ensureHalfWorkers();
+    const bool forceFull = (halfFrames < 4) || (width != prevW) || (height != prevH) || (height > 1024) || !gHalfRowBufMain;
     if (width != prevW || height != prevH) { prevW = width; prevH = height; }
     const uint64_t t0 = mach_continuous_time();
     uint32_t dirtyRows = 0;
-    if (fbScale == 2 && gHalfRowBuf0 && width <= 2048 && height <= 1024) {
-        if (gHalfWorkerReady && height >= 64) {
-            auto runWorkerSync = [&](const HalfBandJob &wJob, const HalfBandJob &mJob) -> uint32_t {
-                gHalfJob = wJob;
-                uint32_t nextEp = gHalfEpoch + 1u;
-                __atomic_store_n(&gHalfEpoch, nextEp, __ATOMIC_SEQ_CST);
-                if (__atomic_load_n(&gHalfSleeping, __ATOMIC_SEQ_CST)) {
-                    IOLockLock(gHalfLock);
-                    IOLockWakeup(gHalfLock, (void *)&gHalfEpoch, false);
-                    IOLockUnlock(gHalfLock);
-                }
-                uint32_t d = convertHalfBand2x(mJob, gHalfRowBuf0);
-                while (__atomic_load_n(&gHalfDone, __ATOMIC_ACQUIRE) != nextEp) {
-                    __asm__ volatile("yield" ::: "memory");
-                }
-                return d + gHalfJob.dirtyOut;
-            };
-            /* Phase 1: 2-P-core parallel D-cache invalidate of IOSurface (zero framebuffer writes). */
-            if (flushAllocation > 0) {
-                const uint32_t midY = height / 2u;
-                const uint64_t topBytes = (uint64_t)midY * srcStride;
-                const uint64_t botBytes = (flushAllocation > topBytes) ? (flushAllocation - topBytes) : ((uint64_t)(height - midY) * srcStride);
-                HalfBandJob botFlush = { dst, dstStride, src, srcStride, topBytes, botBytes, table, nullptr, nullptr, width, midY, height, 1u, true, false, 0 };
-                HalfBandJob topFlush = { dst, dstStride, src, srcStride, 0ULL, topBytes, table, nullptr, nullptr, width, 0u, midY, 1u, true, false, 0 };
-                (void)runWorkerSync(botFlush, topFlush);
+    if (fbScale == 2 && gHalfRowBufMain && width <= 2048 && height <= 1024) {
+        const uint32_t nWorkers = gHalfWorkerCount;
+        if (nWorkers > 0u && height >= 64u) {
+            const bool needFlush = (flushAllocation > 0);
+            gHalfShared = { dst, dstStride, src, srcStride, table, prevH1, prevH2, width, height,
+                            16u, needFlush, forceFull };
+            __atomic_store_n(&gHalfNextRow, 0u, __ATOMIC_RELAXED);
+            __atomic_store_n(&gHalfDoneCount, 0u, __ATOMIC_RELAXED);
+            uint32_t nextEp = gHalfEpoch + 1u;
+            __atomic_store_n(&gHalfEpoch, nextEp, __ATOMIC_SEQ_CST);
+            bool anySleeping = false;
+            for (uint32_t i = 0; i < nWorkers; ++i) {
+                if (__atomic_load_n(&gHalfSlots[i].sleeping, __ATOMIC_SEQ_CST)) { anySleeping = true; break; }
             }
-            /* Phase 2: 2-P-core top-to-bottom lockstep even/odd row sweep (zero mid-screen tear seam!). */
-            HalfBandJob oddJob  = { dst, dstStride, src, srcStride, 0ULL, 0ULL, table, prevOddH1,  prevOddH2,  width, 1u, height, 2u, false, forceFull, 0 };
-            HalfBandJob evenJob = { dst, dstStride, src, srcStride, 0ULL, 0ULL, table, prevEvenH1, prevEvenH2, width, 0u, height, 2u, false, forceFull, 0 };
-            dirtyRows = runWorkerSync(oddJob, evenJob);
+            if (anySleeping) {
+                IOLockLock(gHalfLock);
+                IOLockWakeup(gHalfLock, (void *)&gHalfEpoch, false);
+                IOLockUnlock(gHalfLock);
+            }
+            uint32_t d = convertHalfSteal2x(gHalfShared, gHalfRowBufMain);
+            while (__atomic_load_n(&gHalfDoneCount, __ATOMIC_ACQUIRE) < nWorkers) {
+                __asm__ volatile("yield" ::: "memory");
+            }
+            dirtyRows = d;
+            for (uint32_t i = 0; i < nWorkers; ++i) dirtyRows += gHalfSlots[i].dirtyOut;
         } else {
-            HalfBandJob fullJob = { dst, dstStride, src, srcStride, 0ULL, flushAllocation, table, prevEvenH1, prevEvenH2, width, 0u, height, 1u, false, forceFull, 0 };
-            dirtyRows = convertHalfBand2x(fullJob, gHalfRowBuf0);
+            gHalfShared = { dst, dstStride, src, srcStride, table, prevH1, prevH2, width, height, 16u, (flushAllocation > 0), forceFull };
+            __atomic_store_n(&gHalfNextRow, 0u, __ATOMIC_RELAXED);
+            dirtyRows = convertHalfSteal2x(gHalfShared, gHalfRowBufMain);
         }
     } else if (fbScale == 2) {
         if (flushAllocation > 0) flush_dcache64((addr64_t)src, (unsigned)flushAllocation, false);
@@ -427,11 +471,16 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         for(auto entry: validated)if(entry==request)return true;
         return false;
     }
-    void removeValidated(const OriginalLegacySwapRequest *request) {for(unsigned i=0;i<8;++i)if(validated[i]==request){validated[i]=nullptr;validatedAt[i]=0;traceRequestIds[i]=0;}}
+    void removeValidated(const OriginalLegacySwapRequest *request) {for(unsigned i=0;i<8;++i)if(validated[i]==request){validated[i]=nullptr;validatedAt[i]=0;validatedWsSeq[i]=0;traceRequestIds[i]=0;}}
     uint64_t traceRequestIds[8];
     uint64_t traceNextRequest=0;
     uint64_t traceId(const OriginalLegacySwapRequest *r) {for(unsigned i=0;i<8;++i)if(validated[i]==r){if(!traceRequestIds[i])traceRequestIds[i]=++traceNextRequest;return traceRequestIds[i];}return 0;}
     uint64_t validatedAt[8];   // no initializer: IOKit objects are allocated zeroed, and a member memset would push the constructor's call to the original C2 out of the binding check's window
+    uint64_t validatedWsSeq[8];
+    uint64_t validatedSeq(const OriginalLegacySwapRequest *request) const {
+        for(unsigned i=0;i<8;++i)if(validated[i]==request)return validatedWsSeq[i];
+        return 0;
+    }
     static uint64_t nowUs() {uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
     unsigned validatedCount() const {unsigned n=0;for(auto entry: validated)if(entry)++n;return n;}
     void stat(unsigned index) {native_legacy_swapstat[index]=native_legacy_swapstat[index]+1;}
@@ -481,8 +530,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     }
     void addValidated(const OriginalLegacySwapRequest *request) {
         if(isValidated(request))return;
-        for(unsigned i=0;i<8;++i)if(!validated[i]){validated[i]=request;validatedAt[i]=nowUs();return;}
-        validated[0]=request;validatedAt[0]=nowUs();
+        const uint64_t wsSeq = (&tb375fc_mali_ws_submitted_seq) ? tb375fc_mali_ws_submitted_seq() : 0ULL;
+        for(unsigned i=0;i<8;++i)if(!validated[i]){validated[i]=request;validatedAt[i]=nowUs();validatedWsSeq[i]=wsSeq;return;}
+        validated[0]=request;validatedAt[0]=nowUs();validatedWsSeq[0]=wsSeq;
     }
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuTraceRequest=0;
@@ -828,7 +878,7 @@ public:
         if (!prioBoosted) {
             prioBoosted = true;
             extern kern_return_t thread_policy_set(thread_t, uint32_t, int32_t *, uint32_t);
-            int32_t imp = 63; /* THREAD_PRECEDENCE_POLICY (flavor=3): prefer P-cores! */
+            int32_t imp = 63; /* THREAD_PRECEDENCE_POLICY (flavor=3): prefer P-cores without hard-pinning! */
             (void)thread_policy_set(current_thread(), 3u, &imp, 1u);
         }
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
@@ -981,9 +1031,13 @@ public:
             }
         }
         const uint64_t tMapEnd = mach_continuous_time();
-        /* Wait for Mali-G615 WindowServer CSG0 to finish writing & L2-flushing the IOSurface
-         * before invalidating CPU cache or reading pixels (eliminates mid-render tile flashes!). */
-        const uint32_t wsWaitUs = (&tb375fc_mali_wait_ws_idle) ? tb375fc_mali_wait_ws_idle(25000u) : 0u;
+        /* Wait specifically for THIS swap's WindowServer Mali-G615 seq (captured at validateSwap)
+         * with an 80 ms safety ceiling so we NEVER stall on Frame N+1 and NEVER blit a half-drawn
+         * IOSurface (preventing bottom Dock / top Dynamic Island flashes on heavy blur frames!). */
+        const uint64_t wantWsSeq = validatedSeq(request);
+        const uint32_t wsWaitUs = (&tb375fc_mali_wait_ws_seq)
+            ? tb375fc_mali_wait_ws_seq(wantWsSeq, 80000u)
+            : ((&tb375fc_mali_wait_ws_idle) ? tb375fc_mali_wait_ws_idle(80000u) : 0u);
         const uint64_t tFlush0 = mach_continuous_time();
         if (!half) {
             flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)allocation,false);

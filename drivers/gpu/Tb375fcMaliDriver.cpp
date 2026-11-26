@@ -862,7 +862,7 @@ static bool initMaliHardware(void) {
                     if (idx == gpuOppN / 2u) fMid = fk;
                     if (idx == gpuOppN - 1u) fEnd = fk;
                     if (fk >= 200000u && fk <= 1500000u) {
-                        uint32_t diff = (fk > 1200000u) ? (fk - 1200000u) : (1200000u - fk);
+                        uint32_t diff = (fk > 1400000u) ? (fk - 1400000u) : (1400000u - fk);
                         if (diff < bestDiff) { bestDiff = diff; bestIdx = idx; bestFreq = fk; }
                     }
                 }
@@ -943,6 +943,111 @@ static bool initMaliHardware(void) {
         }
         logPll("after");
         unmapMmio(&pllMap);
+
+        /* MT6897 DVFSRC (0x1C00F000): Preloader/LK boots LPDDR5X at 3094 Mbps with DVFSRC disabled (bctl=0x8).
+         * Call official MT6897 ATF SMC MTK_SIP_VCOREFS_CONTROL(0xC2000506) / MTK_SIP_DVFSRC_INIT(0)
+         * to initialize DVFSRC and unlock full LPDDR5X bandwidth (up to 8533 Mbps / 40.8 GB/s)! */
+        if (boostEn) {
+            auto readDramcMbps = [&]() -> uint32_t {
+                uint32_t vco = 0;
+                MappedPage phyAo = {}, phyNao = {};
+                if (mapMmio(0x10238000ULL, 0x2000u, &phyAo) && mapMmio(0x10236000ULL, 0x2000u, &phyNao)) {
+                    uint32_t rE98   = rd32(phyAo.va, 0xE98u);
+                    uint32_t shuLv  = (rE98 & 0xC000u) >> 14;
+                    uint32_t pllId  = (rE98 & 0x02000000u) ? 1u : 0u;
+                    uint32_t shuOff = 0x700u * (shuLv & 1u);
+                    uint32_t sdmOff = (pllId ? 0x928u : 0x908u) + shuOff;
+                    uint32_t divOff = (pllId ? 0x92Cu : 0x90Cu) + shuOff;
+                    uint32_t ck4Off = 0x153Cu + shuOff;
+                    uint32_t fbkOff = 0x910u + shuOff;
+                    uint32_t dqsOff = 0xD94u + shuOff;
+                    uint32_t caOff  = 0x148Cu + shuOff;
+                    if (ck4Off < 0x2000u && caOff < 0x2000u && sdmOff < 0x2000u) {
+                        uint32_t sdmpcw = (rd32(phyNao.va, sdmOff) & 0x7FFF8u) >> 3;
+                        uint32_t posdiv = (rd32(phyNao.va, divOff) & 0x3800u) >> 11;
+                        uint32_t ckdiv4 = (rd32(phyAo.va,  ck4Off) & 0x4u) >> 2;
+                        uint32_t fbksel = (rd32(phyNao.va, fbkOff) & 0x40u) >> 6;
+                        uint32_t dqsop  = (rd32(phyNao.va, dqsOff) & 0x4000000u) >> 26;
+                        uint32_t caDiv4 = (rd32(phyAo.va,  caOff)  & 0x4u) >> 2;
+                        vco = ((26u * (sdmpcw >> 7)) >> posdiv >> 1 >> ckdiv4) << fbksel;
+                        if (dqsop == 1u) vco >>= (caDiv4 ? 2u : 1u);
+                    }
+                }
+                if (phyAo.va)  unmapMmio(&phyAo);
+                if (phyNao.va) unmapMmio(&phyNao);
+                return vco;
+            };
+            auto mtkSmc4 = [](uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                              uint64_t *o0, uint64_t *o1) {
+                register uint64_t x0 __asm__("x0") = a0;
+                register uint64_t x1 __asm__("x1") = a1;
+                register uint64_t x2 __asm__("x2") = a2;
+                register uint64_t x3 __asm__("x3") = a3;
+                register uint64_t x4 __asm__("x4") = 0;
+                register uint64_t x5 __asm__("x5") = 0;
+                register uint64_t x6 __asm__("x6") = 0;
+                register uint64_t x7 __asm__("x7") = 0;
+                __asm__ volatile("smc #0"
+                    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+                    : : "memory");
+                if (o0) *o0 = x0;
+                if (o1) *o1 = x1;
+            };
+
+            uint32_t dramBefore = readDramcMbps();
+            uint32_t noDramBoost = 0;
+            PE_parse_boot_argn("nodram", &noDramBoost, sizeof(noDramBoost));
+            MappedPage dvfsrcMap = {};
+            if (mapMmio(0x1C00F000ULL, 0x1000u, &dvfsrcMap)) {
+                uint32_t bctl0 = rd32(dvfsrcMap.va, 0x000u);
+                uint32_t sw0   = rd32(dvfsrcMap.va, 0x018u);
+                uint32_t lvl0  = rd32(dvfsrcMap.va, 0x5F0u);
+                uint64_t smcRc = 0xFFFFULL, dramType = 0;
+                if (!noDramBoost && !(bctl0 & 1u)) {
+                    /* Official MT6897 mtk_dvfsrc_probe() ATF init: locks high OPP! */
+                    mtkSmc4(0xC2000506ULL, 0ULL /* MTK_SIP_DVFSRC_INIT */, 0ULL, 0ULL, &smcRc, &dramType);
+                    IOSleep(3);
+                }
+                uint32_t bctl1 = rd32(dvfsrcMap.va, 0x000u);
+                if (!noDramBoost && (bctl1 & 1u)) {
+                    /* Vote max DRAM OPP9 (8533 Mbps) + max VCORE OPP5 + peak BW */
+                    uint32_t swCur = rd32(dvfsrcMap.va, 0x018u);
+                    uint32_t swNew = (swCur & ~0x0000F070u) | (9u << 12) | (5u << 4);
+                    wr32(dvfsrcMap.va, 0x018u, swNew);
+                    wr32(dvfsrcMap.va, 0x1E8u, 0x3FFu); /* DVFSRC_SW_BW */
+                    wr32(dvfsrcMap.va, 0x1F4u, 0x3FFu); /* DVFSRC_SW_PEAK_BW */
+                    IOSleep(3);
+                }
+                uint32_t dramAfterInit = readDramcMbps();
+                /* If INIT kept a lower boot lock, release lock via MTK_SIP_DVFSRC_START(1) with SW_REQ=OPP9 already voted! */
+                uint64_t startRc = 0xFFFFULL;
+                if (!noDramBoost && (bctl1 & 1u) && dramAfterInit > 0u && dramAfterInit < 5500u) {
+                    mtkSmc4(0xC2000506ULL, 1ULL /* MTK_SIP_DVFSRC_START */, 0ULL, 0ULL, &startRc, nullptr);
+                    IOSleep(3);
+                }
+                uint32_t dramFinal = readDramcMbps();
+                uint32_t lvl1 = rd32(dvfsrcMap.va, 0x5F0u);
+                IOLog("Tb375fcMali: DVFSRC initRc=0x%llx type=%llu startRc=0x%llx bctl=0x%x->0x%x swReq=0x%x->0x%x lvl=0x%x->0x%x | DRAMC %u -> %u -> %u Mbps\n",
+                      (unsigned long long)smcRc, (unsigned long long)dramType, (unsigned long long)startRc,
+                      bctl0, bctl1, sw0, rd32(dvfsrcMap.va, 0x018u), lvl0, lvl1,
+                      dramBefore, dramAfterInit, dramFinal);
+                unmapMmio(&dvfsrcMap);
+            }
+            MappedPage mfgTopMap = {};
+            if (mapMmio(0x13FBF000ULL, 0x1000u, &mfgTopMap)) {
+                uint32_t c1 = rd32(mfgTopMap.va, 0x704u);
+                uint32_t c2 = rd32(mfgTopMap.va, 0x708u);
+                uint32_t c3 = rd32(mfgTopMap.va, 0x70Cu);
+                if (c1 != 0x14u || c2 != 0x4u || c3 != 0x00400400u) {
+                    wr32(mfgTopMap.va, 0x704u, 0x00000014u);
+                    wr32(mfgTopMap.va, 0x708u, 0x00000004u);
+                    wr32(mfgTopMap.va, 0x70Cu, 0x00400400u);
+                }
+                IOLog("Tb375fcMali: MFG_TOP AXUSER cfg=0x%x/0x%x/0x%x -> 0x%x/0x%x/0x%x\n",
+                      c1, c2, c3, rd32(mfgTopMap.va, 0x704u), rd32(mfgTopMap.va, 0x708u), rd32(mfgTopMap.va, 0x70Cu));
+                unmapMmio(&mfgTopMap);
+            }
+        }
     }
 
     if (!mapMmio(MT6897_MALI_PHYS, MT6897_MALI_MAP_SIZE, &gMali.maliReg)) {
@@ -1541,7 +1646,7 @@ static int32_t ensureGroupResidentLocked(Tb375fcMaliUserClient *client, uint32_t
     if (maxC > 5u) maxC = 5u;
     if (maxF > 5u) maxF = 5u;
     maxT        = 1u; /* Mali-G615 has exactly 1 tiler; never ask MCU for 5 tilers */
-    grpPrio     = 1u; /* Equal CSF priority across all CSGs so MCU shares endpoints fairly */
+    grpPrio     = client->fIsWindowServer ? 2u : 1u; /* Prioritize WindowServer CSG0 over background apps while GLB_IDLE_EN shares endpoints */
     grpSuspFwVa = g.suspendFwVa ? g.suspendFwVa : slot.fallbackSuspFwVa;
     resuming    = g.hw_suspended && (g.suspendFwVa != 0u);
 
@@ -2702,18 +2807,41 @@ static void maliDriverWorker(void *, wait_result_t) {
     (void)thread_terminate(current_thread());
 }
 
+/* Snapshot WindowServer CSG0's current submitted_seq at validateSwap() time so kickOnce()
+ * waits ONLY for Frame N (never stalling on Frame N+1 submitted early under triple-buffering). */
+extern "C" uint64_t tb375fc_mali_ws_submitted_seq(void);
+extern "C" uint64_t tb375fc_mali_ws_submitted_seq(void) {
+    if (!gMali.schedLock || !gMali.devInfo.mcu_alive) return 0ULL;
+    uint64_t seq = 0ULL;
+    IOLockLock(gMali.schedLock);
+    MaliHwSlot &slot = gMali.slots[0];
+    if (slot.ownerClient && slot.ownerClient->fIsWindowServer &&
+        slot.ownerClient->fLock && slot.ownerClient->fGroups) {
+        Tb375fcMaliUserClient *owner = slot.ownerClient;
+        uint32_t grpIdx = slot.ownerGroupIdx;
+        IOLockLock(owner->fLock);
+        if (grpIdx > 0u && grpIdx < kMaxClientGroups &&
+            owner->fGroups[grpIdx].in_use && owner->fGroups[grpIdx].hw_started) {
+            seq = owner->fGroups[grpIdx].submitted_seq;
+        }
+        IOLockUnlock(owner->fLock);
+    }
+    IOLockUnlock(gMali.schedLock);
+    return seq;
+}
+
 /* Synchronize NativeLegacyDisplay CPU blit with WindowServer's pinned Mali-G615 CSG0 queue.
- * WindowServer submits IOMobileFramebufferSwapEnd on Metal didSchedule (before Mali finishes
- * rasterizing the IOSurface). Waiting for ringIoOutCpu[q]->extract >= ringInsert[q] guarantees
- * Mali-G615 has finished all tiles AND flushed L2+LSC caches (0x233) to DRAM before display reads. */
-extern "C" uint32_t tb375fc_mali_wait_ws_idle(uint32_t max_us);
-extern "C" uint32_t tb375fc_mali_wait_ws_idle(uint32_t max_us) {
+ * If wantSeq > 0, waits specifically for that swap's seq (from seqHist) instead of latest
+ * submitted_seq (avoiding Frame N+1 stalls under triple buffering). Updates g.completed_seq
+ * on completion so userspace MALI_SEL_FENCE_WAIT also sees completion immediately. */
+extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us);
+extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us) {
     if (!gMali.schedLock || !gMali.devInfo.mcu_alive) return 0u;
 
     Tb375fcMaliUserClient *owner = nullptr;
     uint32_t qCount = 0u;
     uint32_t grpIdx = 0u;
-    uint64_t wantSeq = 0u;
+    uint64_t targetSeq = wantSeq;
     uint64_t targets[MALI_MAX_QUEUES_PER_GROUP] = {};
     FwRingIoOutput *ioOuts[MALI_MAX_QUEUES_PER_GROUP] = {};
 
@@ -2728,12 +2856,16 @@ extern "C" uint32_t tb375fc_mali_wait_ws_idle(uint32_t max_us) {
         if (grpIdx > 0u && grpIdx < kMaxClientGroups &&
             owner->fGroups[grpIdx].in_use && owner->fGroups[grpIdx].hw_started) {
             MaliGroupEntry &g = owner->fGroups[grpIdx];
-            wantSeq = g.submitted_seq;
-            if (__atomic_load_n(&g.completed_seq, __ATOMIC_ACQUIRE) < wantSeq) {
+            if (targetSeq == 0ULL || targetSeq > g.submitted_seq) {
+                targetSeq = g.submitted_seq;
+            }
+            if (targetSeq > 0ULL && __atomic_load_n(&g.completed_seq, __ATOMIC_ACQUIRE) < targetSeq) {
                 qCount = g.queue_count;
                 if (qCount > MALI_MAX_QUEUES_PER_GROUP) qCount = MALI_MAX_QUEUES_PER_GROUP;
+                const MaliSeqTarget &st = g.seqHist[targetSeq % kSeqHistSize];
+                const bool hasHist = (st.seq == targetSeq);
                 for (uint32_t qi = 0u; qi < qCount; ++qi) {
-                    targets[qi] = g.ringInsert[qi];
+                    targets[qi] = hasHist ? st.insert[qi] : g.ringInsert[qi];
                     ioOuts[qi]  = g.ringIoOutCpu[qi];
                 }
             }
@@ -2743,13 +2875,13 @@ extern "C" uint32_t tb375fc_mali_wait_ws_idle(uint32_t max_us) {
     IOLockUnlock(gMali.schedLock);
 
     if (!owner) return 0u;
-    if (qCount == 0u || wantSeq == 0u) {
+    if (qCount == 0u || targetSeq == 0ULL) {
         owner->release();
         return 0u;
     }
 
     auto allDone = [&]() -> bool {
-        if (__atomic_load_n(&owner->fGroups[grpIdx].completed_seq, __ATOMIC_ACQUIRE) >= wantSeq) {
+        if (__atomic_load_n(&owner->fGroups[grpIdx].completed_seq, __ATOMIC_ACQUIRE) >= targetSeq) {
             return true;
         }
         for (uint32_t qi = 0u; qi < qCount; ++qi) {
@@ -2761,39 +2893,59 @@ extern "C" uint32_t tb375fc_mali_wait_ws_idle(uint32_t max_us) {
     };
 
     if (allDone()) {
+        uint64_t prev = __atomic_load_n(&owner->fGroups[grpIdx].completed_seq, __ATOMIC_RELAXED);
+        while (targetSeq > prev && !__atomic_compare_exchange_n(&owner->fGroups[grpIdx].completed_seq,
+                                                                 &prev, targetSeq, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
         owner->release();
         return 0u;
     }
 
-    uint64_t t0 = 0, t1 = 0, ns0 = 0, ns1 = 0;
+    uint64_t t0 = 0, tNow = 0, ns0 = 0, nsNow = 0;
     clock_get_uptime(&t0);
     absolutetime_to_nanoseconds(t0, &ns0);
+    const uint64_t deadlineNs = ns0 + static_cast<uint64_t>(max_us) * 1000ULL;
 
     bool done = false;
-    uint32_t spinCap = (max_us < 400u) ? ((max_us + 24u) / 25u) : 16u;
+    /* Fine 25us spin for first 1.5ms avoids XNU IOSleep(1) ~1.2ms timer slack on fast frames */
+    uint32_t spinCap = (max_us < 1500u) ? ((max_us + 24u) / 25u) : 60u;
     for (uint32_t s = 0u; s < spinCap; ++s) {
         IODelay(25);
         if (allDone()) { done = true; break; }
     }
-    uint32_t maxMs = max_us / 1000u;
-    for (uint32_t ms = 0u; !done && ms < maxMs; ++ms) {
+    while (!done) {
+        clock_get_uptime(&tNow);
+        absolutetime_to_nanoseconds(tNow, &nsNow);
+        if (nsNow >= deadlineNs) break;
         IOSleep(1);
         if (allDone()) { done = true; break; }
     }
 
-    clock_get_uptime(&t1);
-    absolutetime_to_nanoseconds(t1, &ns1);
-    uint32_t waitedUs = (ns1 > ns0) ? static_cast<uint32_t>((ns1 - ns0) / 1000ULL) : 1u;
+    if (done) {
+        uint64_t prev = __atomic_load_n(&owner->fGroups[grpIdx].completed_seq, __ATOMIC_RELAXED);
+        while (targetSeq > prev && !__atomic_compare_exchange_n(&owner->fGroups[grpIdx].completed_seq,
+                                                                 &prev, targetSeq, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
+    }
+
+    clock_get_uptime(&tNow);
+    absolutetime_to_nanoseconds(tNow, &nsNow);
+    uint32_t waitedUs = (nsNow > ns0) ? static_cast<uint32_t>((nsNow - ns0) / 1000ULL) : 1u;
 
     owner->release();
 
     static uint32_t sSyncWaits = 0u;
+    static uint32_t sSyncTimeouts = 0u;
     uint32_t n = ++sSyncWaits;
-    if (n <= 20u || (n % 500u) == 0u) {
-        IOLog("Tb375fcMali: ws-display-sync #%u waited=%uus done=%u seq=%llu\n",
-              n, waitedUs, (unsigned)done, (unsigned long long)wantSeq);
+    if (!done) ++sSyncTimeouts;
+    if (n <= 20u || (n % 500u) == 0u || (!done && sSyncTimeouts <= 32u)) {
+        IOLog("Tb375fcMali: ws-display-sync #%u waited=%uus done=%u seq=%llu timeouts=%u\n",
+              n, waitedUs, (unsigned)done, (unsigned long long)targetSeq, sSyncTimeouts);
     }
     return waitedUs;
+}
+
+extern "C" uint32_t tb375fc_mali_wait_ws_idle(uint32_t max_us);
+extern "C" uint32_t tb375fc_mali_wait_ws_idle(uint32_t max_us) {
+    return tb375fc_mali_wait_ws_seq(0ULL, max_us);
 }
 
 extern "C" void tb375fc_mali_probe(void);

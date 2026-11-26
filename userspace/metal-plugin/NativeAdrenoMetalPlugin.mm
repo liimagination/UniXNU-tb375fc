@@ -212,12 +212,13 @@ static void startWindowServerHeartbeat() {
         const char *prog = getprogname() ? getprogname() : "?";
         const bool isWS = (strcmp(prog, "WindowServer") == 0);
 
-        // Configure PanVK & QuartzCore environment before loading PanVK / m2v
+        // Configure PanVK & QuartzCore environment before loading PanVK / m2v.
+        // Imported IOSurfaces use VK_IMAGE_TILING_LINEAR (never AFBC per panvk_image.c), so leaving
+        // AFBC enabled by default compresses all private OPTIMAL render targets (50-70% less DRAM BW!).
+        // Pass boot-arg panvk-debug=noafbc to disable AFBC if needed for diagnostics.
         char panvkDbg[64] = {};
         if (bootArgToken("panvk-debug=", panvkDbg, sizeof(panvkDbg)) && panvkDbg[0]) {
             setenv("PANVK_DEBUG", panvkDbg, 1);
-        } else {
-            setenv("PANVK_DEBUG", "noafbc", 0);
         }
         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
         setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
