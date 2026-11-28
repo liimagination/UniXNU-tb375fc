@@ -98,12 +98,12 @@
 TB375FC 的 UFS LUN2 `userdata` 总范围约 `[2,803,712 .. 62,410,743]`（每块 4 KiB）。当前已被占用的区间：
 
 ```text
-LUN2 LBA (4 KiB/block):
+LUN2 LBA (4 KiB/block，userdata 总范围 [2,803,712 .. 62,410,743] ≈ 227.38 GiB):
   0 .. 2,803,711            : Android GPT + super / vendor_a / boot / persist 等系统分区（严禁写入！）
-  2,803,712 .. 16,349,999   : Android userdata 前段 & 保留缓冲（约 51.6 GiB，含 macOS 27 OS 只读镜像区域，请先核实再动！）
+  2,803,712 .. 16,349,999   : Android userdata 保留区（约 51.67 GiB）
   16,350,000 .. 49,906,175  : ⚠️ macOS 27.3 128 GiB 持久化 APFS Data 卷（活数据！严禁 iPadOS 写入！）
-  49,906,176 .. 54,219,999  : 约 16.4 GiB 间隙区（需先读取核查是否为空/旧 macOS 卷）
-  54,220,000 .. 62,410,743  : 约 31.2 GiB 高位安全写区（原 macOS 早期 PersistOverlay 仅占 54220000..54482152 约 1 GiB，余量 ~30 GiB）
+  49,914,112 .. 54,211,840  : ⚠️ macOS 27.3 只读系统根镜像（RO roots + manifest + hashes，16.39 GiB，强制保护区！严禁写入！）
+  54,220,000 .. 62,410,743  : 约 31.25 GiB 高位连续空闲安全写区（原早期 PersistOverlay 仅占开头 ~1 GiB）
 ```
 
 > **强烈建议**：iPadOS 27 的 `Tb375fcUfsTransport.c` 在初始化早期保持 **strictly read-only**（只允许 SCSI `READ(10)`），等进入持久化阶段前先只读扫描高位 `[54,500,000 .. 62,410,743]` 确认全零后再把 iPadOS 的写窗口硬编码锁死在独立 LBA 区间内，实现 **Android / macOS 27 / iPadOS 27 三系统存储物理互不干扰**。
