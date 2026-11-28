@@ -45,10 +45,11 @@ static uint32_t io_lock, enabled, error_code = TB375FC_UFS_NOT_READY;
 static uint32_t write_win_locked = 0, write_win_first = 0, write_win_blocks = 0;
 static uint8_t  write_win_lun = 0xffu;
 /* Dual hard-bounded safe write zones strictly inside LUN2 userdata [2,803,712..62,410,743],
- * with a mandatory exclusion zone protecting macOS RO roots + manifest + hashes [49,914,112..54,211,840]:
- *   - Low zone  (128 GiB Data): [16,350,000 .. 49,906,176)  (51.67 GiB above userdata start, 31.0 MiB below RO roots)
- *   - High zone (<=31 GiB Data): [54,220,000 .. 62,410,744) (31.875 MiB above RO roots end, <= userdata end) */
-#define TB375FC_UFS_LOW_FLOOR_LBA       16350000u
+ * with a mandatory exclusion zone protecting macOS RO roots + manifest + hashes [49,914,112..54,211,840]
+ * AND reserving [16,350,000..33,127,999] (64.00 GiB) untouched for dual-boot iPadOS 27 Data:
+ *   - Low zone  (64 GiB macOS Data): [33,128,000 .. 49,906,176)  (16,778,176 blocks = 64.0036 GiB, 31.0 MiB below RO roots)
+ *   - High zone (<=31 GiB Data):     [54,220,000 .. 62,410,744)  (31.875 MiB above RO roots end, <= userdata end) */
+#define TB375FC_UFS_LOW_FLOOR_LBA       33128000u
 #define TB375FC_UFS_LOW_CEIL_EXCL_LBA   49906176u
 #define TB375FC_UFS_HIGH_FLOOR_LBA      54220000u
 #define TB375FC_UFS_HIGH_CEIL_EXCL_LBA  62410744u

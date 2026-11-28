@@ -121,11 +121,29 @@ def main():
     vinfo_va = by_name.get("_boot_progress_panic_vinfo", by_name["_vinfo"])
     entry_va = unixthread_pc(data)
 
-    # Extract templates from late-blocks/kernel.macho
-    lb = (DIAG / "late-blocks/kernel.macho").read_bytes()
-    cave1 = bytearray(lb[0x4B8EB08 : 0x4B8EB08 + 0x84])
-    cave2 = bytearray(lb[0x4B8EC08 : 0x4B8EC08 + 0x9C])
-    cave3 = bytearray(lb[0x4B8ED08 : 0x4B8ED08 + 0x84])
+    # Inline verified 420-byte late-blocks progress templates (byte-for-byte identical across Boot 70 & Boot 161;
+    # vinfo_va and branch instructions are re-patched dynamically immediately below).
+    cave1 = bytearray.fromhex(
+        "090194d2e994a1f209fedff2e9fffff22d0d40b9bf011071430300542c0140b9"
+        "9fa10071e3020054290940f9a90200b429110d8b29010491ebff9f520be0bf72"
+        "8f0280520c7438d52ee179922e7808d5df3f03d50a7438d5aa0000370a0480d2"
+        "cb4500b84a0500f1c1ffff5429010d8bef050071a1feff540c7418d59f3f03d5"
+        "70701914"
+    )
+    cave2 = bytearray.fromhex(
+        "fe0f1ff8dc150094fe0741f8090194d2e994a1f209fedff2e9fffff22d0d40b9"
+        "bf011071a30300542c0140b99fa1007143030054290940f9090300b429110d8b"
+        "29010891ebff9f520be0bf72600000340b008052ebffbf728f0280520c7438d5"
+        "2ee179922e7808d5df3f03d50a7438d5aa0000370a0480d2cb4500b84a0500f1"
+        "c1ffff5429010d8bef050071a1feff540c7418d59f3f03d5c0035fd6"
+    )
+    cave3 = bytearray.fromhex(
+        "090194d2e994a1f209fedff2e9fffff22d0d40b9bf011071430300542c0140b9"
+        "9fa10071e3020054290940f9a90200b429110d8b29010c91ebff9f520be0bf72"
+        "8f0280520c7438d52ee179922e7808d5df3f03d50a7438d5aa0000370a0480d2"
+        "cb4500b84a0500f1c1ffff5429010d8bef050071a1feff540c7418d59f3f03d5"
+        "c0ab1814"
+    )
 
     c1_va = entry_va + 0x680
     c2_va = entry_va + 0x780

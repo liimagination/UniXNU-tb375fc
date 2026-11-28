@@ -807,10 +807,12 @@ def main():
         adt_p = work / 'kernel.macho.adt'
         adt_p.write_bytes(dt_bytes)
 
-        # Copy md0-test.dbr: when --persist-storage is enabled, default to 128 GiB UFS LUN2 seed
-        # so we never accidentally mount a tiny 256 MiB volatile APFS Data disk!
+        # Copy md0-test.dbr: when --persist-storage is enabled, default to 64 GiB UFS LUN2 seed
+        # (upper half [33128000..49906176), leaving [16350000..33127999] free for dual-boot iPadOS 27).
         if args.data_seed:
             custom_seed = args.data_seed
+        elif args.persist_storage and (DESKTOP_DIR / 'macos-data-seed-64g.dbr').is_file():
+            custom_seed = DESKTOP_DIR / 'macos-data-seed-64g.dbr'
         elif args.persist_storage and (DESKTOP_DIR / 'macos-data-seed-128g.dbr').is_file():
             custom_seed = DESKTOP_DIR / 'macos-data-seed-128g.dbr'
         else:

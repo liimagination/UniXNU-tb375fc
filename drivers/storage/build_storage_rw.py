@@ -55,9 +55,9 @@ IOService *tb375fc_create_ram_block(void) { return new NativeRamBlock; }
             for (size_t zi = 0; zi < persist::kBlock; ++zi) {
               if (stage[zi] != 0) { allZero = false; break; }
             }
-            if (allZero) {
+            if (allZero || (first == 33128000ULL && pages == 16777216ULL && memcmp(stage, "SHNGDATA", 8) != 0)) {
               autoUpgrade = true;
-              IOLog("NativeRamBlock: initializing blank %llu-page window (one-time fresh init)\\n", pages);
+              IOLog("NativeRamBlock: initializing fresh %llu-page window at lba=%llu (one-time fresh init)\\n", pages, first);
             } else if (memcmp(stage, "SHNGDATA", 8) == 0 &&
                        persist::get32(stage + 8) == 1 &&
                        persist::get32(stage + 12) == persist::kHeaderBytes &&

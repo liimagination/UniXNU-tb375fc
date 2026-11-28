@@ -26,9 +26,9 @@ extern volatile uint64_t native_data_persist_syncs;
 namespace {
 constexpr uint32_t kPersistHighFirstLba  = 54220000u; /* <=31.24 GiB window strictly above macOS RO roots [54220000..62410743] */
 constexpr uint32_t kPersistHighMaxBlocks = 8190744u;
-constexpr uint32_t kPersistLowFirstLba   = 16350000u; /* 128 GiB window strictly below macOS RO roots [16350000..49906175] */
+constexpr uint32_t kPersistLowFirstLba   = 33128000u; /* 64 GiB macOS Data window [33128000..49906175], leaving [16350000..33127999] (64 GiB) free for iPadOS 27 */
 constexpr uint32_t kPersistLowCeilExcl   = 49906176u; /* 31.0 MiB hard guard below kDesktopManifestLba (49,914,112) */
-constexpr uint32_t kPersistLowMaxBlocks  = kPersistLowCeilExcl - kPersistLowFirstLba; /* 33,556,176 blocks = 128.0066 GiB */
+constexpr uint32_t kPersistLowMaxBlocks  = kPersistLowCeilExcl - kPersistLowFirstLba; /* 16,778,176 blocks = 64.0036 GiB */
 constexpr uint32_t kUserdataFirstLba     = 2803712u;
 constexpr uint32_t kUserdataLastLba      = 62410743u;
 constexpr unsigned kBusyRetries          = 2000u;
