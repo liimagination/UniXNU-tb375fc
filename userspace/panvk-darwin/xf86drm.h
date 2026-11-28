@@ -119,11 +119,12 @@ int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points,
 int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point,
                        uint32_t src_handle, uint64_t src_point, uint32_t flags);
 
-/* Darwin helpers for Tb375fcMali BO open/mmap/munmap */
+/* Darwin helpers for Tb375fcMali BO open/mmap/munmap/zero */
 int   panthor_darwin_open_render_node(void);
 void  panthor_darwin_close_render_node(int fd);
 void *panthor_darwin_mmap_bo(int fd, uint64_t mmap_offset, size_t size);
 int   panthor_darwin_munmap_bo(int fd, void *addr, size_t size);
+void  panthor_darwin_zero_bo_range(int fd, uint32_t bo_handle, uint64_t offset, uint64_t size);
 
 #ifdef __cplusplus
 }

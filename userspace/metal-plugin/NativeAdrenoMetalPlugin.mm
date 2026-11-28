@@ -30,6 +30,7 @@
 
 #include "adreno-metal-src/IOGPUMetalDeviceShim.h"
 #include "adreno-metal-src/NativeBridgeMetalFrontend.h"
+#include "adreno-metal-src/SharedShaderCache.h"
 #include "adreno-metal-src/bridge/NativeMetalObjects.h"
 #include "../mali-panvk/Tb375fcMaliABI.h"
 
@@ -64,6 +65,11 @@ static bool bootArgToken(const char *key, char *out, size_t outSize) {
 static bool bootArgIsZero(const char *prefixWithEq) {
     char val[32] = {};
     return bootArgToken(prefixWithEq, val, sizeof(val)) && strcmp(val, "0") == 0;
+}
+
+static bool bootArgIsOne(const char *prefixWithEq) {
+    char val[32] = {};
+    return bootArgToken(prefixWithEq, val, sizeof(val)) && strcmp(val, "1") == 0;
 }
 
 static io_connect_t maliLogConnect() {
@@ -213,12 +219,27 @@ static void startWindowServerHeartbeat() {
         const bool isWS = (strcmp(prog, "WindowServer") == 0);
 
         // Configure PanVK & QuartzCore environment before loading PanVK / m2v.
-        // Imported IOSurfaces use VK_IMAGE_TILING_LINEAR (never AFBC per panvk_image.c), so leaving
-        // AFBC enabled by default compresses all private OPTIMAL render targets (50-70% less DRAM BW!).
-        // Pass boot-arg panvk-debug=noafbc to disable AFBC if needed for diagnostics.
+        // Mali AFBC lossless compression is now enabled by default (panvk_image_plane_bind_mem
+        // zeroes AFBC superblock headers on every bind, preventing stale-slab AS1 MMU faults).
+        // Pass boot-arg panvk-debug=noafbc (or other flags) to override for A/B experiments.
         char panvkDbg[64] = {};
         if (bootArgToken("panvk-debug=", panvkDbg, sizeof(panvkDbg)) && panvkDbg[0]) {
-            setenv("PANVK_DEBUG", panvkDbg, 1);
+            if (strcmp(panvkDbg, "none") != 0) {
+                setenv("PANVK_DEBUG", panvkDbg, 1);
+            }
+        }
+        // Forward upstream diag=1 / gpu-trace=1 so runtime-policy.log and timing.log (>=8ms encoders) work on demand.
+        if (bootArgIsOne("diag=") || bootArgIsOne("gpu-trace=")) {
+            setenv("SHENG_DIAG", "1", 1);
+            char bootUuid[64] = {};
+            size_t bsz = sizeof(bootUuid) - 1;
+            if (sysctlbyname("kern.bootsessionuuid", bootUuid, &bsz, nullptr, 0) == 0) {
+                setenv("NATIVE_METAL_BOOT_SESSION", bootUuid, 1);
+            }
+            setenv("METAL2VULKAN_ENCODER_TIMES", "8ms", 1);
+            setenv("METAL2VULKAN_QUEUE_TIMES", "1", 1);
+        } else {
+            unsetenv("SHENG_DIAG");
         }
         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
         setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
@@ -227,6 +248,19 @@ static void startWindowServerHeartbeat() {
         setenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD", "1", 1);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+
+        // Shared system shader cache (upstream SharedShaderCache.h + kern_exec.c bind mount):
+        // WindowServer writes world-readable entries to /private/var/tmp/NativeAdrenoMetal.cache,
+        // and every other sandboxed client reads them via /Library/GPUBundles/NativeAdrenoMetal.cache!
+        const bool useSystemCache = !bootArgIsZero("gpu-prime-system=");
+        std::string wsSysCacheDir;
+        if (useSystemCache) {
+            if (isWS) {
+                wsSysCacheDir = systemcache::writerDirectory();
+            } else {
+                native_bridge_metal_system_cache(systemcache::kReaderPath, systemcache::kOwners, 2, false);
+            }
+        }
 
         char panvkPath[1024] = {};
         if (!findPanvkLibrary(panvkPath, sizeof(panvkPath))) {
@@ -253,6 +287,10 @@ static void startWindowServerHeartbeat() {
             candidates.push_back({c, checkSb});
         };
         {
+            // 0. WindowServer shared system shader cache writer directory (/private/var/tmp/NativeAdrenoMetal.cache)
+            if (isWS && !wsSysCacheDir.empty()) {
+                addCandidate(wsSysCacheDir, false);
+            }
             // 1. Container/User HOME (App Sandbox widgets, GeneralSettings, NotificationCenter, Calendar, etc.)
             if (const char *home = getenv("HOME"); home && home[0]) {
                 std::string croot = canonicalizePath((std::string(home) + "/Library/Caches").c_str());
@@ -301,6 +339,10 @@ static void startWindowServerHeartbeat() {
         std::string chosenCache;
         for (const auto &cand : candidates) {
             if (!canWriteDirQuietly(cand.path.c_str(), cand.checkSandbox)) continue;
+            const bool isSysWriter = isWS && !wsSysCacheDir.empty() && cand.path == canonicalizePath(wsSysCacheDir.c_str());
+            if (isWS) {
+                native_bridge_metal_system_cache(nullptr, nullptr, 0, isSysWriter);
+            }
             std::string mesaDir = cand.path + "/panvk";
             if (canWriteDirQuietly(mesaDir.c_str(), cand.checkSandbox)) {
                 setenv("MESA_SHADER_CACHE_DIR", mesaDir.c_str(), 1);

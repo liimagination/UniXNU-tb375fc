@@ -82,11 +82,11 @@ def lzma_alone(raw: bytes, dict_size: int, nice_len: int = 273) -> bytes:
     return packed
 
 
-def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False, persist_storage: bool = False, mali_driver: bool = False) -> Path:
+def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False, persist_storage: bool = False, mali_driver: bool = False, connsys_driver: bool = False) -> Path:
     kout = output / 'kernel-out'
     kout.mkdir(parents=True, exist_ok=True)
     diag = kout / 'xnu-cdc-board-diag.macho'
-    if not rebuild_display and not touch_stage1 and not persist_storage and diag.is_file() and diag.stat().st_size == 142868480:
+    if not rebuild_display and not touch_stage1 and not persist_storage and not connsys_driver and diag.is_file() and diag.stat().st_size == 142868480:
         print(f'[1/5] Reusing prelinked Full Desktop Tier 3 kernel: {diag}', flush=True)
         return diag
 
@@ -122,7 +122,9 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
         '\t\t    "<!DOCTYPE plist PUBLIC \\"-//Apple//DTD PLIST 1.0//EN\\" \\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\\">\\n"\n'
         '\t\t    "<plist version=\\"1.0\\"><dict>"\n'
         '\t\t    "<key>com.apple.watchdogd</key><true/>"\n'
+        '\t\t    "<key>com.apple.fairplayd</key><true/>"\n'
         '\t\t    "<key>com.apple.fairplayd.A2</key><true/>"\n'
+        '\t\t    "<key>com.apple.fairplayd.H2</key><true/>"\n'
         '\t\t    "<key>com.apple.accessoryupdaterd</key><true/>"\n'
         '\t\t    "<key>com.apple.identityservicesd</key><true/>"\n'
         '\t\t    "<key>com.apple.CommCenter</key><true/>"\n'
@@ -164,7 +166,13 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
         '\t\t    "<key>com.apple.uarpd</key><true/>"\n'
         '\t\t    "<key>com.apple.uarpassetmanagerd</key><true/>"\n'
         '\t\t    "<key>com.apple.XProtect.daemon.scan</key><true/>"\n'
+        '\t\t    "<key>com.apple.XProtect.daemon.scan.startup</key><true/>"\n'
         '\t\t    "<key>com.apple.modelcatalogd</key><true/>"\n'
+        '\t\t    "<key>com.apple.modelmanagerd</key><true/>"\n'
+        '\t\t    "<key>com.apple.intelligenceplatformd</key><true/>"\n'
+        '\t\t    "<key>com.apple.intelligencecontextd</key><true/>"\n'
+        '\t\t    "<key>com.apple.intelligenceflowd</key><true/>"\n'
+        '\t\t    "<key>com.apple.generativeexperiencesd</key><true/>"\n'
         '\t\t    "</dict></plist>\\n";\n'
         '\t\tstatic const char user_disabled_plist[] =\n'
         '\t\t    "<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>\\n"\n'
@@ -189,7 +197,6 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
         '\t\t    "<key>com.apple.suggestd</key><true/>"\n'
         '\t\t    "<key>com.apple.duetexpertd</key><true/>"\n'
         '\t\t    "<key>com.apple.knowledge-agent</key><true/>"\n'
-        '\t\t    "<key>com.apple.chronod</key><true/>"\n'
         '\t\t    "<key>com.apple.ScreenTimeAgent</key><true/>"\n'
         '\t\t    "<key>com.apple.triald</key><true/>"\n'
         '\t\t    "<key>com.apple.wallpaper.export</key><true/>"\n'
@@ -208,6 +215,22 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
         '\t\t    "<key>com.apple.UsageTrackingAgent</key><true/>"\n'
         '\t\t    "<key>com.apple.weatherd</key><true/>"\n'
         '\t\t    "<key>com.apple.newsd</key><true/>"\n'
+        '\t\t    "<key>com.apple.intelligenceflowd</key><true/>"\n'
+        '\t\t    "<key>com.apple.generativeexperiencesd</key><true/>"\n'
+        '\t\t    "<key>com.apple.intelligenceplatformd</key><true/>"\n'
+        '\t\t    "<key>com.apple.intelligencecontextd</key><true/>"\n'
+        '\t\t    "<key>com.apple.intelligencetasksd</key><true/>"\n'
+        '\t\t    "<key>com.apple.intelligentroutingd</key><true/>"\n'
+        '\t\t    "<key>com.apple.callintelligenced</key><true/>"\n'
+        '\t\t    "<key>com.apple.visualintelligenced</key><true/>"\n'
+        '\t\t    "<key>com.apple.SiriTTSTrainingAgent</key><true/>"\n'
+        '\t\t    "<key>com.apple.SiriNCService</key><true/>"\n'
+        '\t\t    "<key>com.apple.siriinferenced</key><true/>"\n'
+        '\t\t    "<key>com.apple.siriusergroundingd</key><true/>"\n'
+        '\t\t    "<key>com.apple.assistant_cdmd</key><true/>"\n'
+        '\t\t    "<key>com.apple.textunderstandingd</key><true/>"\n'
+        '\t\t    "<key>com.apple.tipsd</key><true/>"\n'
+        '\t\t    "<key>com.apple.modelmanagerd</key><true/>"\n'
         '\t\t    "</dict></plist>\\n";\n'
         '\t\t(void)native_gpu_addon_parents(p, scratch, "/private/var/db/com.apple.xpc.launchd/disabled.plist");\n'
         '\t\tint werr1 = native_gpu_addon_write("/private/var/db/com.apple.xpc.launchd/disabled.plist",\n'
@@ -227,6 +250,13 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
             '\t\tif (PE_parse_boot_argn("touch", &touch_stage, sizeof(touch_stage)) && touch_stage >= 1 && touch_stage <= 4) {\n'
             '\t\t\ttb375fc_touch_probe();\n'
             '\t\t}\n'
+            '\t}'
+        )
+    if connsys_driver:
+        new_shim += (
+            '\n\tif (!error) {\n'
+            '\t\textern void tb375fc_connsys_init(void);\n'
+            '\t\ttb375fc_connsys_init();\n'
             '\t}'
         )
     assert old_shim in kexec_src_txt, 'Expected native_owner_macos_boot_shims in kern_exec.c'
@@ -384,6 +414,10 @@ def build_kernel(output: Path, rebuild_display: bool, touch_stage1: bool = False
         assert len(vmatches) == 1, f'Expected 1 vm_kern.o, got {len(vmatches)}'
         src_lines[vmatches[0]] = str(vmk_o)
     src_lines.extend([str(pwr_o), str(eth_late), str(eth_bind_o), str(eth_addr_o)])
+    if connsys_driver:
+        connsys_o = TIER3_KDIR / 'connsys/Tb375fcConnSys.o'
+        assert connsys_o.is_file(), f'Missing {connsys_o}'
+        src_lines.append(str(connsys_o))
     filelist = kout / 'link.filelist'
     filelist.write_text('\n'.join(src_lines) + '\n')
 
@@ -500,6 +534,9 @@ def build_xnulz(layout_h: Path, lazy_code_hashes: bool, smp: bool = False, extra
     index, = (n for n, line in enumerate(lines) if line.startswith(ARGS_PREFIX))
     args = lines[index].rstrip().removeprefix(ARGS_PREFIX).removesuffix('"').split()
     assert all(not arg.startswith('apfs-boot-shim=') for arg in args)
+    # Enable kernel read-only shared system shader cache bind-mount (/private/var/tmp/NativeAdrenoMetal.cache
+    # -> /Library/GPUBundles/NativeAdrenoMetal.cache) so all sandboxed apps share WindowServer's shader cache!
+    args = ['gpu-prime-system=1' if a == 'gpu-prime-system=0' else a for a in args]
     # Keep apfs-boot-shim=1 so mount-phase-1/2 succeed without Apple Silicon iSC xART,
     # and pass wdt=-1 to disable Apple hardware watchdogd panics.
     args.append('apfs-boot-shim=1')
@@ -511,6 +548,9 @@ def build_xnulz(layout_h: Path, lazy_code_hashes: bool, smp: bool = False, extra
     if smp:
         args.append('smp=1')
     if extra_boot_args:
+        # Drop any inherited vsync= from base XnuLz.c when extra_boot_args supplies vsync=
+        if any(a.startswith('vsync=') for a in extra_boot_args):
+            args = [a for a in args if not a.startswith('vsync=')]
         args.extend(extra_boot_args)
     boot_args = ' '.join(args)
     lines[index] = ARGS_PREFIX + boot_args + '"\n'
@@ -559,6 +599,8 @@ def main():
                         help='link isolated bounded UFS LUN2 PersistOverlay storage archive (boot-arg gated via data-persist=1|2)')
     parser.add_argument('--mali-driver', action='store_true',
                         help='link Tb375fcMaliDriver IOUserClient (libTb375fcTouch_mali4.a) for mali=4')
+    parser.add_argument('--connsys-driver', action='store_true',
+                        help='link Tb375fcConnSys IOUserClient (connsys/Tb375fcConnSys.o) and pack tb375fc-connsys-ctl')
     parser.add_argument('--panvk-icd', type=Path, default=None,
                         help='pack Mesa panvk libvulkan_panfrost.dylib instead of SwiftShader')
     parser.add_argument('--inproc-bundle', type=Path, default=None,
@@ -569,6 +611,8 @@ def main():
                         help='tag ADT cpu0..3 as E-cluster (A510) and cpu4..7 as P-cluster (A715)')
     parser.add_argument('--no-notch', action='store_true',
                         help='clear ADT /product/partially-occluded-display & has-round-cornered-mac-display so flat LCD hides MacBook notch/island')
+    parser.add_argument('--no-bgra-fixup', action='store_true',
+                        help='omit 26C5035r QuartzCore 8-bit BGRA framebuffer text-fixup (stay on 64-bit RGhA)')
     args = parser.parse_args()
     if args.menu_timeout is not None and args.menu_timeout < 1:
         parser.error('--menu-timeout must leave time to enter the menu')
@@ -583,7 +627,7 @@ def main():
             parser.error('--touch-stage supplies its own touch=N boot argument')
         args.extra_boot_arg.append(f'touch={touch_stage}')
     output.mkdir(parents=True, exist_ok=True)
-    diag_kernel = build_kernel(output, args.rebuild_display, touch_stage > 0, persist_storage=args.persist_storage, mali_driver=args.mali_driver)
+    diag_kernel = build_kernel(output, args.rebuild_display, touch_stage > 0, persist_storage=args.persist_storage, mali_driver=args.mali_driver, connsys_driver=args.connsys_driver)
     if args.lazy_code_hashes:
         symbols = subprocess.check_output(['xcrun', 'nm', str(diag_kernel)], text=True)
         for name in ('_cs_native4k_lazy', '_cs_native4k_lazy_authenticate'):
@@ -675,6 +719,9 @@ def main():
             mali_fw = DESKTOP_DIR / 'mali_csffw.bin'
             if mali_fw.is_file() and any(a.startswith('mali=') for a in args.extra_boot_arg):
                 addon_entries.append(('mali_csffw.bin', 0o644, mali_fw.read_bytes()))
+            connsys_ctl = TIER3_KDIR / 'connsys/tb375fc-connsys-ctl'
+            if args.connsys_driver and connsys_ctl.is_file():
+                addon_entries.append(('sbin/tb375fc-connsys-ctl', 0o755, connsys_ctl.read_bytes()))
         addon_p = work / 'kernel.macho.gpuaddon'
         addon_p.write_bytes(pack_m7.make_addon(addon_entries))
 
@@ -685,6 +732,9 @@ def main():
         trust_hashes = [daemon_hash]
         if launcher == custom_launcher:
             trust_hashes.append(signed_cdhash(launcher))
+        connsys_ctl = TIER3_KDIR / 'connsys/tb375fc-connsys-ctl'
+        if args.connsys_driver and connsys_ctl.is_file():
+            trust_hashes.append(signed_cdhash(connsys_ctl))
         if not cpu_only and args.inproc_bundle:
             trust_hashes.append(signed_cdhash(bundle))
             inproc_panvk = bundle / 'Contents/MacOS/libvulkan_panfrost.dylib'
@@ -715,6 +765,15 @@ def main():
         d_props.append(('vmm-present', struct.pack('<I', 1)))
         d_props.append(('sleep-disabled', struct.pack('<I', 1)))
         tree[1][d_idx] = (d_props, tree[1][d_idx][1])
+        if not args.no_bgra_fixup:
+            # Upstream UniXNU 26C5035r fixup: NOP `tbnz w8, #0` (08060037 -> 1f2003d5) in
+            # QuartzCore IOMFBDisplay::framebuffer_pixel_format (dyld_shared_cache_arm64e.03+0x5de1134)
+            # so WindowServer renders 8-bit BGRA8 instead of 64-bit RGhA half-float (50% less GPU bandwidth!).
+            ch_idx = next(i for i, c in enumerate(tree[1]) if dict(c[0]).get('name', b'').rstrip(b'\0') == b'chosen')
+            ch_props = [(k, v) for k, v in tree[1][ch_idx][0] if k != 'text-fixups']
+            ch_props.append(('text-fixups', b'dyld_shared_cache_arm64e.03,5de1134,08060037,1f2003d5\0'))
+            tree[1][ch_idx] = (ch_props, tree[1][ch_idx][1])
+            print('      ADT /chosen/text-fixups enabled: QuartzCore 26C5035r 8-bit BGRA8 framebuffer', flush=True)
         if args.no_notch:
             p_idx = next(i for i, c in enumerate(tree[1]) if dict(c[0]).get('name', b'').rstrip(b'\0') == b'product')
             p_props = [(k, v) for k, v in tree[1][p_idx][0]
@@ -748,8 +807,14 @@ def main():
         adt_p = work / 'kernel.macho.adt'
         adt_p.write_bytes(dt_bytes)
 
-        # Copy md0-test.dbr (prefer 256m ultraslim official Data seed so full SwiftShader + Data seed fits in 35 MiB outer.img!)
-        custom_seed = args.data_seed or (DESKTOP_DIR / 'macos-data-seed-256m-ultraslim.dbr')
+        # Copy md0-test.dbr: when --persist-storage is enabled, default to 128 GiB UFS LUN2 seed
+        # so we never accidentally mount a tiny 256 MiB volatile APFS Data disk!
+        if args.data_seed:
+            custom_seed = args.data_seed
+        elif args.persist_storage and (DESKTOP_DIR / 'macos-data-seed-128g.dbr').is_file():
+            custom_seed = DESKTOP_DIR / 'macos-data-seed-128g.dbr'
+        else:
+            custom_seed = DESKTOP_DIR / 'macos-data-seed-256m-ultraslim.dbr'
         if not custom_seed.is_file():
             custom_seed = DESKTOP_DIR / 'macos-data-seed-512m-slim.dbr'
         if not custom_seed.is_file():

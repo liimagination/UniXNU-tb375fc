@@ -24,11 +24,14 @@ extern volatile uint64_t native_data_persist_syncs;
 }
 
 namespace {
-constexpr uint32_t kPersistFirstLba   = 54220000u;
-constexpr uint32_t kUserdataFirstLba  = 2803712u;
-constexpr uint32_t kUserdataLastLba   = 62410743u;
-constexpr uint32_t kMaxWindowBlocks   = 1048576u; /* 4 GiB safety cap */
-constexpr unsigned kBusyRetries       = 2000u;
+constexpr uint32_t kPersistHighFirstLba  = 54220000u; /* <=31.24 GiB window strictly above macOS RO roots [54220000..62410743] */
+constexpr uint32_t kPersistHighMaxBlocks = 8190744u;
+constexpr uint32_t kPersistLowFirstLba   = 16350000u; /* 128 GiB window strictly below macOS RO roots [16350000..49906175] */
+constexpr uint32_t kPersistLowCeilExcl   = 49906176u; /* 31.0 MiB hard guard below kDesktopManifestLba (49,914,112) */
+constexpr uint32_t kPersistLowMaxBlocks  = kPersistLowCeilExcl - kPersistLowFirstLba; /* 33,556,176 blocks = 128.0066 GiB */
+constexpr uint32_t kUserdataFirstLba     = 2803712u;
+constexpr uint32_t kUserdataLastLba      = 62410743u;
+constexpr unsigned kBusyRetries          = 2000u;
 
 static uint32_t g_mode = 0;
 static uint32_t g_first_lba = 0;
@@ -163,7 +166,15 @@ int native_ufs_store_open(uint64_t window_blocks, uint64_t *first_lba_out, const
         if (why_out) *why_out = "data-persist not enabled";
         return 0;
     }
-    if (!window_blocks || window_blocks > kMaxWindowBlocks) {
+    uint32_t chosen_first = 0;
+    uint64_t zone_ceil_excl = 0;
+    if (window_blocks > 0 && window_blocks <= kPersistHighMaxBlocks) {
+        chosen_first = kPersistHighFirstLba;
+        zone_ceil_excl = (uint64_t)kUserdataLastLba + 1ULL;
+    } else if (window_blocks > kPersistHighMaxBlocks && window_blocks <= kPersistLowMaxBlocks) {
+        chosen_first = kPersistLowFirstLba;
+        zone_ceil_excl = (uint64_t)kPersistLowCeilExcl;
+    } else {
         if (why_out) *why_out = "invalid window_blocks";
         return 0;
     }
@@ -172,9 +183,9 @@ int native_ufs_store_open(uint64_t window_blocks, uint64_t *first_lba_out, const
         if (why_out) *why_out = "live LUN2 GPT check failed";
         return 0;
     }
-    const uint64_t end_lba_excl = (uint64_t)kPersistFirstLba + window_blocks;
-    if (end_lba_excl > (uint64_t)kUserdataLastLba + 1ULL) {
-        if (why_out) *why_out = "window exceeds userdata last_lba";
+    const uint64_t end_lba_excl = (uint64_t)chosen_first + window_blocks;
+    if (end_lba_excl > zone_ceil_excl) {
+        if (why_out) *why_out = "window exceeds safe zone ceiling";
         return 0;
     }
 
@@ -191,7 +202,7 @@ int native_ufs_store_open(uint64_t window_blocks, uint64_t *first_lba_out, const
             (uint32_t)(window_blocks - 1u),
         };
         for (unsigned i = 0; i < 5u; ++i) {
-            if (ufs_read_retry(kPersistFirstLba + offsets[i], 1u, sample) == 0) {
+            if (ufs_read_retry(chosen_first + offsets[i], 1u, sample) == 0) {
                 sample_nz[i] = count_nonzero(sample, 4096);
                 if (i == 0u) {
                     for (unsigned c = 0; c < 8u; ++c) {
@@ -207,7 +218,7 @@ int native_ufs_store_open(uint64_t window_blocks, uint64_t *first_lba_out, const
     }
 
     if (mode == 2u) {
-        int wrc = tb375fc_ufs_set_write_window(2u, kPersistFirstLba, (uint32_t)window_blocks);
+        int wrc = tb375fc_ufs_set_write_window(2u, chosen_first, (uint32_t)window_blocks);
         if (wrc != 0) {
             IOLog("Tb375fcPersistStore: set_write_window failed rc=%d\n", wrc);
             if (why_out) *why_out = "set_write_window rejected";
@@ -216,13 +227,13 @@ int native_ufs_store_open(uint64_t window_blocks, uint64_t *first_lba_out, const
     }
 
     g_mode = mode;
-    g_first_lba = kPersistFirstLba;
+    g_first_lba = chosen_first;
     g_win_blocks = (uint32_t)window_blocks;
     g_opened = true;
-    if (first_lba_out) *first_lba_out = kPersistFirstLba;
+    if (first_lba_out) *first_lba_out = chosen_first;
     IOLog("Tb375fcPersistStore: OPEN mode=%u (%s) lba=[%u..%u] blocks=%u gpt=0 hdr='%s' sample_nz=(%u,%u,%u,%u,%u)\n",
           mode, (mode == 2u) ? "RW" : "RO-PROBE",
-          kPersistFirstLba, (uint32_t)(end_lba_excl - 1ULL), g_win_blocks, hdr_sig,
+          chosen_first, (uint32_t)(end_lba_excl - 1ULL), g_win_blocks, hdr_sig,
           sample_nz[0], sample_nz[1], sample_nz[2], sample_nz[3], sample_nz[4]);
     return 1;
 }

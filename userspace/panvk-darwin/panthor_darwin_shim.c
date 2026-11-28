@@ -48,9 +48,39 @@ struct darwin_host_bo {
 static struct darwin_host_bo g_host_bos[MAX_DARWIN_HOST_BOS];
 static struct darwin_host_bo g_mmap_bos[MAX_DARWIN_HOST_BOS];
 static struct darwin_host_bo g_anon_bos[MAX_DARWIN_HOST_BOS];
+static struct darwin_host_bo g_wc_zero_bos[MAX_DARWIN_HOST_BOS];
 static bool                  g_mmap_cached[MAX_DARWIN_HOST_BOS];
 static uint16_t              g_anon_map_cnt[MAX_DARWIN_HOST_BOS];
 static uint32_t              g_max_bo_handle = 0;
+
+/* Compact O(N_active) active-handle lists so flush_all_host_bos() never scans thousands
+ * of empty/WriteCombine BO slots on every vkQueueSubmit! (pos == 0 means not in list.) */
+static uint32_t              g_active_host_list[MAX_DARWIN_HOST_BOS];
+static uint32_t              g_active_host_pos[MAX_DARWIN_HOST_BOS];
+static uint32_t              g_active_host_cnt = 0;
+
+static uint32_t              g_active_cached_list[MAX_DARWIN_HOST_BOS];
+static uint32_t              g_active_cached_pos[MAX_DARWIN_HOST_BOS];
+static uint32_t              g_active_cached_cnt = 0;
+
+static inline void active_list_add(uint32_t *list, uint32_t *pos, uint32_t *cnt, uint32_t h) {
+    if (h == 0 || h >= MAX_DARWIN_HOST_BOS || pos[h] != 0) return;
+    uint32_t idx = (*cnt)++;
+    list[idx] = h;
+    pos[h] = idx + 1u;
+}
+
+static inline void active_list_remove(uint32_t *list, uint32_t *pos, uint32_t *cnt, uint32_t h) {
+    if (h == 0 || h >= MAX_DARWIN_HOST_BOS || pos[h] == 0) return;
+    uint32_t idx = pos[h] - 1u;
+    uint32_t last = --(*cnt);
+    if (idx != last) {
+        uint32_t moved = list[last];
+        list[idx] = moved;
+        pos[moved] = idx + 1u;
+    }
+    pos[h] = 0;
+}
 
 static inline int64_t now_mono_ns(void) {
     struct timespec ts;
@@ -62,48 +92,65 @@ static inline void note_bo_handle_locked(uint32_t h) {
     if (h > g_max_bo_handle && h < MAX_DARWIN_HOST_BOS) g_max_bo_handle = h;
 }
 
-static inline void arm64_dcache_clean(const void *addr, size_t len) {
+static inline void arm64_dcache_clean_nodsb(const void *addr, size_t len) {
     if (!addr || !len) return;
     uintptr_t p = (uintptr_t)addr & ~63ULL;
     uintptr_t end = ((uintptr_t)addr + len + 63ULL) & ~63ULL;
     for (; p < end; p += 64ULL) {
         __asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
     }
-    __asm__ volatile("dsb sy" ::: "memory");
 }
 
-static inline void arm64_dcache_clean_inval(const void *addr, size_t len) {
+static inline void arm64_dcache_clean_inval_nodsb(const void *addr, size_t len) {
     if (!addr || !len) return;
     uintptr_t p = (uintptr_t)addr & ~63ULL;
     uintptr_t end = ((uintptr_t)addr + len + 63ULL) & ~63ULL;
     for (; p < end; p += 64ULL) {
         __asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
     }
+}
+
+static inline void arm64_dcache_clean(const void *addr, size_t len) {
+    if (!addr || !len) return;
+    arm64_dcache_clean_nodsb(addr, len);
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static inline void arm64_dcache_clean_inval(const void *addr, size_t len) {
+    if (!addr || !len) return;
+    arm64_dcache_clean_inval_nodsb(addr, len);
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
 static void flush_all_host_bos(bool invalidate, size_t *out_hkb, size_t *out_mkb) {
     size_t hbytes = 0, mbytes = 0;
-    uint32_t max_h = g_max_bo_handle;
-    if (max_h >= MAX_DARWIN_HOST_BOS) max_h = MAX_DARWIN_HOST_BOS - 1;
-    for (uint32_t i = 1; i <= max_h; ++i) {
+    if (g_active_host_cnt == 0 && g_active_cached_cnt == 0) {
+        if (out_hkb) *out_hkb = 0;
+        if (out_mkb) *out_mkb = 0;
+        return;
+    }
+    for (uint32_t k = 0; k < g_active_host_cnt; ++k) {
+        uint32_t i = g_active_host_list[k];
         void *p = g_host_bos[i].ptr;
         size_t sz = g_host_bos[i].size;
-        /* Skip >= 2 MiB host IOSurfaces (large render targets/swapchain buffers; already cleaned on import) */
         if (p && sz > 0 && sz < (2ULL << 20)) {
             hbytes += sz;
-            if (invalidate) arm64_dcache_clean_inval(p, sz);
-            else            arm64_dcache_clean(p, sz);
+            if (invalidate) arm64_dcache_clean_inval_nodsb(p, sz);
+            else            arm64_dcache_clean_nodsb(p, sz);
         }
-        p = g_mmap_bos[i].ptr;
-        sz = g_mmap_bos[i].size;
-        /* Only flush actively CPU-mapped BOs that use cached Normal-WB mappings.
-         * Unmapped Private GPU BOs (anon_bos never passed to mmap) and kernel WriteCombine BOs need zero flush. */
+    }
+    for (uint32_t k = 0; k < g_active_cached_cnt; ++k) {
+        uint32_t i = g_active_cached_list[k];
+        void *p = g_mmap_bos[i].ptr;
+        size_t sz = g_mmap_bos[i].size;
         if (p && g_mmap_cached[i] && sz > 0 && sz <= (128ULL << 20)) {
             mbytes += sz;
-            if (invalidate) arm64_dcache_clean_inval(p, sz);
-            else            arm64_dcache_clean(p, sz);
+            if (invalidate) arm64_dcache_clean_inval_nodsb(p, sz);
+            else            arm64_dcache_clean_nodsb(p, sz);
         }
+    }
+    if (hbytes > 0 || mbytes > 0) {
+        __asm__ volatile("dsb sy" ::: "memory");
     }
     if (out_hkb) *out_hkb = hbytes >> 10;
     if (out_mkb) *out_mkb = mbytes >> 10;
@@ -239,6 +286,7 @@ void *panthor_darwin_mmap_bo(int fd, uint64_t mmap_offset, size_t size) {
             g_mmap_bos[bo_handle].size = asz;
             g_mmap_cached[bo_handle] = true;
             g_anon_map_cnt[bo_handle]++;
+            active_list_add(g_active_cached_list, g_active_cached_pos, &g_active_cached_cnt, bo_handle);
             note_bo_handle_locked(bo_handle);
         }
         pthread_mutex_unlock(&g_bo_lock);
@@ -257,6 +305,9 @@ void *panthor_darwin_mmap_bo(int fd, uint64_t mmap_offset, size_t size) {
         pthread_mutex_lock(&g_bo_lock);
         g_mmap_bos[bo_handle].ptr = (void *)(uintptr_t)addr;
         g_mmap_bos[bo_handle].size = (size_t)map_size;
+        if (g_mmap_cached[bo_handle]) {
+            active_list_add(g_active_cached_list, g_active_cached_pos, &g_active_cached_cnt, bo_handle);
+        }
         note_bo_handle_locked(bo_handle);
         pthread_mutex_unlock(&g_bo_lock);
     }
@@ -280,6 +331,7 @@ int panthor_darwin_munmap_bo(int fd, void *addr, size_t size) {
                 g_mmap_bos[i].ptr = NULL;
                 g_mmap_bos[i].size = 0;
                 g_mmap_cached[i] = false;
+                active_list_remove(g_active_cached_list, g_active_cached_pos, &g_active_cached_cnt, i);
             }
             break;
         }
@@ -287,6 +339,7 @@ int panthor_darwin_munmap_bo(int fd, void *addr, size_t size) {
             found_handle = i;
             g_mmap_bos[i].ptr = NULL;
             g_mmap_bos[i].size = 0;
+            active_list_remove(g_active_cached_list, g_active_cached_pos, &g_active_cached_cnt, i);
             break;
         }
     }
@@ -301,6 +354,74 @@ int panthor_darwin_munmap_bo(int fd, void *addr, size_t size) {
     }
     (void)IOConnectUnmapMemory64(conn, found_handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)addr);
     return 0;
+}
+
+void panthor_darwin_zero_bo_range(int fd, uint32_t bo_handle, uint64_t offset, uint64_t size) {
+    if (size == 0 || bo_handle == 0 || bo_handle >= MAX_DARWIN_HOST_BOS) return;
+    io_connect_t conn = fd_to_conn(fd);
+    if (conn == MACH_PORT_NULL) return;
+
+    void *ptr = NULL;
+    size_t bo_sz = 0;
+    bool need_dcache_clean = false;
+
+    pthread_mutex_lock(&g_bo_lock);
+    if (g_anon_bos[bo_handle].ptr) {
+        ptr = g_anon_bos[bo_handle].ptr;
+        bo_sz = g_anon_bos[bo_handle].size;
+        need_dcache_clean = true;
+    } else if (g_host_bos[bo_handle].ptr) {
+        ptr = g_host_bos[bo_handle].ptr;
+        bo_sz = g_host_bos[bo_handle].size;
+        need_dcache_clean = true;
+    } else if (g_mmap_bos[bo_handle].ptr) {
+        ptr = g_mmap_bos[bo_handle].ptr;
+        bo_sz = g_mmap_bos[bo_handle].size;
+        need_dcache_clean = g_mmap_cached[bo_handle];
+    } else if (g_wc_zero_bos[bo_handle].ptr) {
+        ptr = g_wc_zero_bos[bo_handle].ptr;
+        bo_sz = g_wc_zero_bos[bo_handle].size;
+        need_dcache_clean = g_mmap_cached[bo_handle];
+    }
+    pthread_mutex_unlock(&g_bo_lock);
+
+    if (!ptr) {
+        /* Lazily map WriteCombine BO once for fast zeroing of recycled AFBC superblock headers
+         * without adding unmapped private GPU texture slabs to g_active_cached_list. */
+        mach_vm_address_t addr = 0;
+        mach_vm_size_t map_size = 0;
+        kern_return_t kr = IOConnectMapMemory64(conn, bo_handle, mach_task_self(),
+                                                &addr, &map_size,
+                                                kIOMapAnywhere | kIOMapWriteCombineCache);
+        if (kr != KERN_SUCCESS || !addr) return;
+        bool drop_dup = false;
+        pthread_mutex_lock(&g_bo_lock);
+        if (!g_wc_zero_bos[bo_handle].ptr) {
+            g_wc_zero_bos[bo_handle].ptr = (void *)(uintptr_t)addr;
+            g_wc_zero_bos[bo_handle].size = (size_t)map_size;
+            note_bo_handle_locked(bo_handle);
+        } else {
+            drop_dup = true;
+        }
+        ptr = g_wc_zero_bos[bo_handle].ptr;
+        bo_sz = g_wc_zero_bos[bo_handle].size;
+        need_dcache_clean = g_mmap_cached[bo_handle];
+        pthread_mutex_unlock(&g_bo_lock);
+        if (drop_dup) {
+            (void)IOConnectUnmapMemory64(conn, bo_handle, mach_task_self(), addr);
+        }
+    }
+
+    if (!ptr || offset >= bo_sz) return;
+    uint64_t avail = bo_sz - offset;
+    size_t len = (size > avail) ? (size_t)avail : (size_t)size;
+    void *dst = (uint8_t *)ptr + offset;
+    memset(dst, 0, len);
+    if (need_dcache_clean) {
+        arm64_dcache_clean(dst, len);
+    } else {
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
 }
 
 static int call_mali(io_connect_t conn, uint32_t sel,
@@ -336,6 +457,9 @@ int panthor_darwin_import_host_handle(int fd, void *host_ptr, uint64_t size,
         pthread_mutex_lock(&g_bo_lock);
         g_host_bos[out.bo_handle].ptr = host_ptr;
         g_host_bos[out.bo_handle].size = (size_t)out.size;
+        if (host_ptr && out.size > 0 && out.size < (2ULL << 20)) {
+            active_list_add(g_active_host_list, g_active_host_pos, &g_active_host_cnt, out.bo_handle);
+        }
         note_bo_handle_locked(out.bo_handle);
         pthread_mutex_unlock(&g_bo_lock);
     }
@@ -1132,9 +1256,17 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
                     uint64_t pt = is_tl ? sops[s].timeline_value : 1;
                     if (pt > 0) {
                         uint32_t sh = sops[s].handle;
-                        int64_t dl = now_mono_ns() + 10000000000LL;
-                        drmSyncobjTimelineWait(fd, &sh, &pt, 1, dl,
-                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+                        bool already_signaled = false;
+                        if (sh > 0 && sh < MAX_DARWIN_SYNCOBJ) {
+                            pthread_mutex_lock(&g_lock);
+                            already_signaled = (g_syncs[sh].in_use && g_syncs[sh].signaled_point >= pt);
+                            pthread_mutex_unlock(&g_lock);
+                        }
+                        if (!already_signaled) {
+                            int64_t dl = now_mono_ns() + 10000000000LL;
+                            drmSyncobjTimelineWait(fd, &sh, &pt, 1, dl,
+                                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+                        }
                     }
                 }
             }
@@ -1180,11 +1312,10 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
         uint64_t aligned_sz = (req->size + 4095ULL) & ~4095ULL;
         if (aligned_sz == 0) { errno = EINVAL; return -1; }
 
-        /* With 512 MiB kmem_io, mappable BOs up to 16 MiB (WindowServer m2v 16 MiB slab + PanVK
-         * sync/cs/desc/shader BOs) use hardware WriteCombine kIOMemoryKernelUserShared (kernel
-         * caps WS <= 16 MiB / 48 MiB, non-WS <= 1 MiB / 4 MiB, global <= 64 MiB out of 512 MiB
-         * kmem_io), dropping WindowServer submit flush from ~450 us (m=23 MB) to ~5-50 us! */
-        if (no_mmap || aligned_sz <= (16ULL << 20)) {
+        /* With Boot 156+ kernel WriteCombine caps (32 MiB/BO, 256 MiB WS, 128 MiB non-WS,
+         * 1024 MiB global), allow mappable BOs up to 32 MiB to take the zero-flush hardware
+         * WriteCombine path so m2v 16-32 MiB slabs never fall back to cached anon-mmap flush! */
+        if (no_mmap || aligned_sz <= (32ULL << 20)) {
             struct Tb375fcMaliBoCreateIn in = {
                 .size = aligned_sz,
                 .flags = no_mmap ? MALI_BO_NO_MMAP : 0,
@@ -1247,19 +1378,29 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
         struct drm_gem_close *req = (struct drm_gem_close *)arg;
         void *anon_ptr = NULL;
         size_t anon_sz = 0;
+        void *wc_zero_ptr = NULL;
         if (req->handle > 0 && req->handle < MAX_DARWIN_HOST_BOS) {
             pthread_mutex_lock(&g_bo_lock);
             g_host_bos[req->handle].ptr = NULL;
             g_host_bos[req->handle].size = 0;
             g_mmap_bos[req->handle].ptr = NULL;
             g_mmap_bos[req->handle].size = 0;
+            wc_zero_ptr = g_wc_zero_bos[req->handle].ptr;
+            g_wc_zero_bos[req->handle].ptr = NULL;
+            g_wc_zero_bos[req->handle].size = 0;
             anon_ptr = g_anon_bos[req->handle].ptr;
             anon_sz = g_anon_bos[req->handle].size;
             g_anon_bos[req->handle].ptr = NULL;
             g_anon_bos[req->handle].size = 0;
             g_anon_map_cnt[req->handle] = 0;
             g_mmap_cached[req->handle] = false;
+            active_list_remove(g_active_host_list, g_active_host_pos, &g_active_host_cnt, req->handle);
+            active_list_remove(g_active_cached_list, g_active_cached_pos, &g_active_cached_cnt, req->handle);
             pthread_mutex_unlock(&g_bo_lock);
+        }
+        if (wc_zero_ptr) {
+            (void)IOConnectUnmapMemory64(conn, req->handle, mach_task_self(),
+                                         (mach_vm_address_t)(uintptr_t)wc_zero_ptr);
         }
         struct Tb375fcMaliHandleIn in = { .handle = req->handle, .pad = 0 };
         int rc = call_mali(conn, MALI_SEL_BO_DESTROY, &in, sizeof(in), NULL, NULL);
@@ -1355,9 +1496,17 @@ int drmIoctl(int fd, unsigned long request, void *arg) {
                     uint64_t pt = is_tl ? sops[s].timeline_value : 1;
                     if (pt > 0) {
                         uint32_t sh = sops[s].handle;
-                        int64_t dl = now_mono_ns() + 10000000000LL;
-                        drmSyncobjTimelineWait(fd, &sh, &pt, 1, dl,
-                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+                        bool already_signaled = false;
+                        if (sh > 0 && sh < MAX_DARWIN_SYNCOBJ) {
+                            pthread_mutex_lock(&g_lock);
+                            already_signaled = (g_syncs[sh].in_use && g_syncs[sh].signaled_point >= pt);
+                            pthread_mutex_unlock(&g_lock);
+                        }
+                        if (!already_signaled) {
+                            int64_t dl = now_mono_ns() + 10000000000LL;
+                            drmSyncobjTimelineWait(fd, &sh, &pt, 1, dl,
+                                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+                        }
                     }
                 }
             }

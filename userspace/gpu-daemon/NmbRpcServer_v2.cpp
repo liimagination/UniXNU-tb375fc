@@ -69,6 +69,12 @@ static inline bool read_tex_desc(m7wire::Reader &r, NmbTextureDescriptor &d) {
     d.type = w.type; d.format = w.format; d.width = w.width; d.height = w.height;
     d.depth = w.depth; d.levels = w.levels; d.samples = w.samples; d.array_length = w.array_length;
     d.usage = w.usage; d.options = w.options; d.rotation = w.rotation;
+    /* Remap MTLStorageModeMemoryless (3 << 4) -> MTLStorageModePrivate (2 << 4) so
+     * RenderBox / iconservicesagent / NotificationCenter / WallpaperImageExtension
+     * succeed instead of failing with Unsupported(MemorylessTexture) in a 4000/s loop! */
+    if (((d.options >> 4) & 0xFu) == 3u) {
+        d.options = (d.options & ~0xF0ULL) | (2ULL << 4);
+    }
     d.framebuffer_only = w.framebuffer_only; d.is_drawable = w.is_drawable; d.swizzle = w.swizzle;
     d.allow_gpu_optimized_contents = 1;
     return true;
@@ -828,6 +834,11 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
     auto ch = get_client(client_id);
     NmbDevice *dev = (client_id == 1 || !gBgDevice) ? gDevice : gBgDevice;
     std::mutex &dev_mu = (dev == gDevice) ? gVkMu : gBgVkMu;
+    struct OptLock {
+        std::mutex *m;
+        explicit OptLock(std::mutex &mu, bool on) : m(on ? &mu : nullptr) { if (m) m->lock(); }
+        ~OptLock() { if (m) m->unlock(); }
+    };
     gRpcCount.fetch_add(1, std::memory_order_relaxed);
     if (op < 128u) gOpCounts[op].fetch_add(1, std::memory_order_relaxed);
     if (client_id == 1) {
@@ -840,15 +851,10 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
         gC1LastOp.store(op, std::memory_order_relaxed);
         gC1LastOpMs.store(monotonic_ms(), std::memory_order_relaxed);
     } else {
-        /* Rate-limit rogue background RPC storms (e.g. iconservicesagent / NotificationCenter
-         * spinning at 6,600 RPCs/s) so WindowServer (client=1) is never starved of gVkMu or CPU! */
-        uint64_t now_ms = monotonic_ms();
-        uint64_t win_ms = gBgWindowMs.load(std::memory_order_relaxed);
-        if (now_ms >= win_ms + 100ULL) {
-            gBgWindowMs.store(now_ms, std::memory_order_relaxed);
-            gBgWindowCount.store(1u, std::memory_order_relaxed);
-        } else if (gBgWindowCount.fetch_add(1u, std::memory_order_relaxed) > 200u) {
-            usleep(5000);
+        static thread_local bool bgQosSet = false;
+        if (!bgQosSet) {
+            bgQosSet = true;
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
         }
     }
     struct WorkerGuard {
@@ -997,7 +1003,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             auto *ctx = new ShmemDeallocCtx{ client_id, sid, 0 };
             NmbBuffer *b = nullptr;
             {
-                std::lock_guard<std::mutex> dlk(dev_mu);
+                OptLock dlk(dev_mu, !gRealMali);
                 b = nmb_buffer_new_no_copy_releasing(dev, (void *)dva, aligned, opts, shmem_dealloc_trampoline, ctx);
                 if (!b) {
                     // Retry with StorageModeShared if Managed/other shared flag was refused
@@ -1030,7 +1036,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             }
             if (!r.ok) { reply_err(out, "bad args"); break; }
             NmbBuffer *b = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); b = nmb_buffer_new(dev, len, opts, has_init ? ptr : nullptr); }
+            { OptLock dlk(dev_mu, !gRealMali); b = nmb_buffer_new(dev, len, opts, has_init ? ptr : nullptr); }
             if (!b) {
                 reply_err(out, nmb_last_error());
             } else {
@@ -1051,16 +1057,26 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
                 reply_err(out, "daemon nocopy shmem map failed");
                 break;
             }
-            uint64_t import_len = (req_len & 4095ULL) == 0 ? req_len : aligned;
+            uint64_t avail = (mapped > page_off) ? (mapped - page_off) : 0;
+            uint64_t import_len = (req_len > 0 && req_len <= avail) ? req_len : avail;
             auto *ctx = new ShmemDeallocCtx{ client_id, sid, cb_id };
             NmbBuffer *b = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); b = nmb_buffer_new_no_copy_releasing(dev, (void *)(dva + page_off), import_len, opts, shmem_dealloc_trampoline, ctx); }
+            { OptLock dlk(dev_mu, !gRealMali); b = nmb_buffer_new_no_copy_releasing(dev, (void *)(dva + page_off), import_len, opts, shmem_dealloc_trampoline, ctx); }
             if (!b) {
+                const char *err = nmb_last_error();
+                gpud_log("[gpud] OP_BUFFER_NEW_NOCOPY failed off=%llu len=%llu aligned=%llu opts=0x%llx err=%s (fallback copy)\n",
+                         (unsigned long long)page_off, (unsigned long long)req_len,
+                         (unsigned long long)aligned, (unsigned long long)opts, err ? err : "?");
+                // Graceful fallback to a copied Shared buffer so read-only / special VM ranges never crash clients
+                if (import_len > 0 && import_len <= 16ULL * 1024ULL * 1024ULL) {
+                    uint64_t copy_opts = (opts & ~0xF0ULL); // MTLResourceStorageModeShared
+                    OptLock dlk(dev_mu, !gRealMali);
+                    b = nmb_buffer_new(dev, import_len, copy_opts, (const void *)(dva + page_off));
+                }
                 daemon_shmem_unmap(sid);
                 delete ctx;
-                gpud_log("[gpud] OP_BUFFER_NEW_NOCOPY failed off=%llu len=%llu aligned=%llu opts=0x%llx err=%s\n",
-                         (unsigned long long)page_off, (unsigned long long)req_len,
-                         (unsigned long long)aligned, (unsigned long long)opts, nmb_last_error());
+            }
+            if (!b) {
                 reply_err(out, nmb_last_error());
             } else {
                 uint64_t hid = put_handle<NmbBuffer, nmb_buffer_release>(ch->mu, ch->buffers, b);
@@ -1195,8 +1211,27 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
         case OP_TEXTURE_NEW: {
             NmbTextureDescriptor d{};
             if (!read_tex_desc(r, d)) { reply_err(out, "bad args"); break; }
+            if (client_id > 1) {
+                static thread_local uint64_t tlWinMs = 0;
+                static thread_local uint32_t tlTexCnt = 0;
+                uint64_t nowMs = monotonic_ms();
+                if (nowMs - tlWinMs >= 1000) { tlWinMs = nowMs; tlTexCnt = 0; }
+                if (++tlTexCnt > 200) {
+                    /* Cap runaway >200/s OP_TEXTURE_NEW retry loops without starving Dock/Finder/Wallpaper */
+                    usleep(4000);
+                }
+            }
             NmbTexture *t = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); t = nmb_texture_new(dev, &d); }
+            { OptLock dlk(dev_mu, !gRealMali); t = nmb_texture_new(dev, &d); }
+            if (client_id > 1) {
+                static std::atomic<uint32_t> bgTexLog{0};
+                uint32_t n = bgTexLog.fetch_add(1, std::memory_order_relaxed);
+                if (n < 10) {
+                    gpud_log("[gpud] bg OP_TEXTURE_NEW #%u client=%u %llux%llu fmt=%llu type=%llu ok=%d err=%s\n",
+                             n + 1, client_id, (unsigned long long)d.width, (unsigned long long)d.height,
+                             (unsigned long long)d.format, (unsigned long long)d.type, t ? 1 : 0, t ? "" : nmb_last_error());
+                }
+            }
             if (!t) reply_err(out, nmb_last_error());
             else {
                 uint64_t tid = put_handle<NmbTexture, nmb_texture_release>(ch->mu, ch->textures, t);
@@ -1234,7 +1269,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
                 }
             }
             NmbTexture *t = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); t = nmb_texture_new_on_buffer(b.get(), &d, off, bpr, iosurf); }
+            { OptLock dlk(dev_mu, !gRealMali); t = nmb_texture_new_on_buffer(b.get(), &d, off, bpr, iosurf); }
             if (!t) {
                 gpud_log("[gpud] tex_on_buf FAILED client=%u (%llux%llu fmt=%llu off=0x%llx bpr=%llu iosurf=%d): %s\n",
                          client_id, (unsigned long long)d.width, (unsigned long long)d.height,
@@ -1263,7 +1298,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
                 off = 0;
             }
             NmbTexture *t = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); t = nmb_texture_new_on_surface(b.get(), &d, off, bpr, pfmt, plane, w, h, coff, cbpr); }
+            { OptLock dlk(dev_mu, !gRealMali); t = nmb_texture_new_on_surface(dev, b.get(), &d, off, bpr, pfmt, plane, w, h, coff, cbpr, 0, nullptr, nullptr); }
             if (!t) {
                 static std::atomic<uint32_t> surfFailLog{0};
                 if (surfFailLog.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -1346,7 +1381,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             auto t = get_handle(ch->mu, ch->textures, tid);
             if (!t) { reply_err(out, "invalid texture"); break; }
             bool rep_ok = false;
-            { std::lock_guard<std::mutex> dlk(dev_mu); rep_ok = nmb_texture_replace(t.get(), reg, lv, sl, ptr, bpr, bpi, blen); }
+            { OptLock dlk(dev_mu, !gRealMali); rep_ok = nmb_texture_replace(t.get(), reg, lv, sl, ptr, bpr, bpi, blen); }
             if (!rep_ok)
                 reply_err(out, nmb_last_error());
             else
@@ -1363,7 +1398,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             if (!t) { reply_err(out, "invalid texture"); break; }
             std::vector<uint8_t> tmp(len);
             bool get_ok = false;
-            { std::lock_guard<std::mutex> dlk(dev_mu); get_ok = nmb_texture_get_bytes(t.get(), tmp.data(), bpr, bpi, len, reg, lv, sl); }
+            { OptLock dlk(dev_mu, !gRealMali); get_ok = nmb_texture_get_bytes(t.get(), tmp.data(), bpr, bpi, len, reg, lv, sl); }
             if (!get_ok)
                 reply_err(out, nmb_last_error());
             else {
@@ -1619,7 +1654,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             gInPso.fetch_add(1, std::memory_order_relaxed);
             if (client_id == 1) gpud_log("[gpud] c1 compute PSO START\n");
             NmbComputePipeline *pso = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); pso = nmb_compute_pipeline_new_with_options(dev, fn.get(), opts.ptr()); }
+            { OptLock dlk(dev_mu, !gRealMali); pso = nmb_compute_pipeline_new_with_options(dev, fn.get(), opts.ptr()); }
             gInPso.fetch_sub(1, std::memory_order_relaxed);
             uint64_t dt = monotonic_ms() - t0;
             if (!pso) {
@@ -1649,7 +1684,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             gInPso.fetch_add(1, std::memory_order_relaxed);
             if (client_id == 1) gpud_log("[gpud] c1 computeDesc PSO START\n");
             NmbComputePipeline *pso = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); pso = nmb_compute_pipeline_new_with_descriptor(dev, &desc.d, opts.ptr()); }
+            { OptLock dlk(dev_mu, !gRealMali); pso = nmb_compute_pipeline_new_with_descriptor(dev, &desc.d, opts.ptr()); }
             gInPso.fetch_sub(1, std::memory_order_relaxed);
             uint64_t dt = monotonic_ms() - t0;
             if (!pso) {
@@ -1756,7 +1791,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             gInPso.fetch_add(1, std::memory_order_relaxed);
             if (client_id == 1) gpud_log("[gpud] c1 render PSO START (%s)\n", pso_label.c_str());
             NmbRenderPipeline *pso = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); pso = nmb_render_pipeline_new_with_options(dev, &desc.d, opts.ptr()); }
+            { OptLock dlk(dev_mu, !gRealMali); pso = nmb_render_pipeline_new_with_options(dev, &desc.d, opts.ptr()); }
             gInPso.fetch_sub(1, std::memory_order_relaxed);
             uint64_t dt = monotonic_ms() - t0;
             if (!pso) {
@@ -1817,7 +1852,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
                 break;
             }
             NmbRenderPipeline *pso = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); pso = nmb_tile_pipeline_new(dev, &desc.d, opts.ptr()); }
+            { OptLock dlk(dev_mu, !gRealMali); pso = nmb_tile_pipeline_new(dev, &desc.d, opts.ptr()); }
             if (!pso) {
                 gpud_log("[gpud] tile PSO FAILED client=%u: %s\n", client_id, nmb_last_error());
                 reply_err(out, nmb_last_error());
@@ -2234,7 +2269,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             auto cb = get_handle(ch->mu, ch->cbs, r.get_u64());
             if (!cb) { reply_err(out, "invalid cb"); break; }
             NmbEncoder *enc = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); enc = nmb_compute_encoder_new(cb.get()); }
+            { OptLock dlk(dev_mu, !gRealMali); enc = nmb_compute_encoder_new(cb.get()); }
             if (!enc) reply_err(out, nmb_last_error());
             else {
                 uint64_t eid = gNextHandle.fetch_add(1, std::memory_order_relaxed);
@@ -2248,7 +2283,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             auto cb = get_handle(ch->mu, ch->cbs, r.get_u64());
             if (!cb) { reply_err(out, "invalid cb"); break; }
             NmbEncoder *enc = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); enc = nmb_blit_encoder_new(cb.get()); }
+            { OptLock dlk(dev_mu, !gRealMali); enc = nmb_blit_encoder_new(cb.get()); }
             if (!enc) reply_err(out, nmb_last_error());
             else {
                 uint64_t eid = gNextHandle.fetch_add(1, std::memory_order_relaxed);
@@ -2280,7 +2315,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
                 reply_err(out, "invalid render pass desc"); break;
             }
             NmbEncoder *enc = nullptr;
-            { std::lock_guard<std::mutex> dlk(dev_mu); enc = nmb_render_encoder_new(cb.get(), &rp); }
+            { OptLock dlk(dev_mu, !gRealMali); enc = nmb_render_encoder_new(cb.get(), &rp); }
             if (!enc) reply_err(out, nmb_last_error());
             else {
                 uint64_t eid = gNextHandle.fetch_add(1, std::memory_order_relaxed);
@@ -2305,7 +2340,7 @@ static void handle_rpc(uint32_t client_id, const uint8_t *req_buf, size_t req_le
             if (!enc) { reply_err(out, "invalid encoder"); break; }
             bool ok = false;
             {
-                std::lock_guard<std::mutex> dlk(dev_mu);
+                OptLock dlk(dev_mu, !gRealMali);
                 ok = replay_encoder_batch(*ch, enc, r);
                 if (do_end) {
                     if (ok) ok = nmb_encoder_end(enc);
@@ -2509,7 +2544,7 @@ int main(int argc, char **argv) {
     const char *loader_path = "/usr/lib/libvk_swiftshader.dylib";
     if (access("/usr/lib/libvulkan_panfrost.dylib", R_OK) == 0) {
         loader_path = "/usr/lib/libvulkan_panfrost.dylib";
-        setenv("PANVK_DEBUG", "noafbc,linear", 1);
+        setenv("PANVK_DEBUG", "noafbc", 1);
         // Wait up to 8s for Tb375fcMali IOService to finish GPUEB + CSF MCU bring-up
         for (int w = 0; w < 80; ++w) {
             io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("Tb375fcMali"));
@@ -3035,10 +3070,47 @@ int main(int argc, char **argv) {
             uint32_t user_act_id = 0;
             bool disp_assert_ok = false;
             bool disp_assert_err_logged = false;
+            bool wp_fixed = false;
+            uint32_t hb_ticks = 0;
             for (;;) {
                 sleep(15);
+                hb_ticks++;
                 uint64_t rpcs = gRpcCount.load(std::memory_order_relaxed);
                 if (rpcs == 0) continue;
+                /* Auto-switch default x420 Aerial wallpaper to static RGB Big Sur Graphic once Index.plist appears */
+                if (!wp_fixed && access("/Users/user/Library/Application Support/com.apple.wallpaper/store/Index.plist", W_OK) == 0) {
+                    const char *wp_sh =
+                        "F='/Users/user/Library/Application Support/com.apple.wallpaper/store/Index.plist';"
+                        "J='[{\"relative\":\"file:///System/Library/Desktop%20Pictures/.thumbnails/Big%20Sur%20Graphic.heic\"}]';"
+                        "if plutil -p \"$F\" | grep -Eq '\"default\"|aerials'; then "
+                        "  plutil -replace AllSpacesAndDisplays.Linked.Content.Choices.0.Provider -string com.apple.wallpaper.choice.image \"$F\";"
+                        "  plutil -replace AllSpacesAndDisplays.Linked.Content.Choices.0.Files -json \"$J\" \"$F\";"
+                        "  plutil -replace SystemDefault.Linked.Content.Choices.0.Provider -string com.apple.wallpaper.choice.image \"$F\";"
+                        "  plutil -replace SystemDefault.Linked.Content.Choices.0.Files -json \"$J\" \"$F\";"
+                        "  kill -9 $(ps -axo pid,comm | awk '/Wallpaper/{print $1}') 2>/dev/null;"
+                        "  exit 0;"
+                        "else exit 1; fi";
+                    extern char **environ;
+                    pid_t wpid = 0;
+                    const char *wargv[] = {"/bin/sh", "-c", wp_sh, nullptr};
+                    if (posix_spawn(&wpid, "/bin/sh", nullptr, nullptr, (char *const *)wargv, environ) == 0) {
+                        int wst = 0; (void)waitpid(wpid, &wst, 0);
+                        if (WIFEXITED(wst) && WEXITSTATUS(wst) == 0) {
+                            gpud_log("[gpud] auto-switched default x420 wallpaper -> static Big Sur Graphic.heic\n");
+                        } else {
+                            wp_fixed = true;
+                        }
+                    }
+                }
+                /* Keep 1 GiB RAM Data volume from filling with diagnostic logs during long sessions */
+                if ((hb_ticks % 20u) == 0u) {
+                    extern char **environ;
+                    pid_t cpid = 0;
+                    const char *cargv[] = {"/bin/sh", "-c", "rm -rf /private/var/db/diagnostics/Persist/* /private/var/db/diagnostics/Special/* /Library/Logs/DiagnosticReports/*.ips 2>/dev/null", nullptr};
+                    if (posix_spawn(&cpid, "/bin/sh", nullptr, nullptr, (char *const *)cargv, environ) == 0) {
+                        int cst = 0; (void)waitpid(cpid, &cst, 0);
+                    }
+                }
                 if (declare_user_act) {
                     (void)declare_user_act(CFSTR("TB375FC Display KeepAlive"), 0, &user_act_id);
                 }

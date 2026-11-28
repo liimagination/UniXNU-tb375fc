@@ -24,6 +24,7 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <stdint.h>
@@ -62,6 +63,17 @@ void proc_selfname(char *buf, int size);
 class Tb375fcMaliUserClient;
 
 namespace {
+
+static int sMaliShortSleepEvent = 0;
+
+/* Non-coalesced microsecond wait: avoids XNU IOSleep(1) 1.5-4 ms timer coalescing slack
+ * while yielding the CPU core cleanly instead of spinning 1.5 ms in IODelay(). */
+static inline void maliShortSleepUs(uint32_t us) {
+    assert_wait_timeout_with_leeway(reinterpret_cast<event_t>(&sMaliShortSleepEvent),
+                                    THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL,
+                                    us, 0, kMicrosecondScale);
+    thread_block(THREAD_CONTINUE_NULL);
+}
 
 constexpr uint64_t MT6897_MALI_PHYS        = 0x13000000ULL;
 constexpr uint64_t MT6897_MALI_MAP_SIZE    = 0x00200000ULL; /* 2 MiB: Control + MMU + MCU + Doorbells 0..23 */
@@ -160,10 +172,14 @@ constexpr uint32_t AS_TRANSCFG_LO   = 0x30u;
 
 constexpr uint32_t AS_CMD_UPDATE    = 1u;
 constexpr uint32_t AS_CMD_LOCK      = 2u;
+constexpr uint32_t AS_CMD_UNLOCK    = 3u;
 constexpr uint32_t AS_CMD_FLUSH_PT  = 4u;
+constexpr uint32_t AS_CMD_FLUSH_MEM = 5u;
 
 /* CSF Doorbells: DB 0 = Global (0x80000), DB n = 0x80000 + n * 0x10000 */
 static inline uint32_t CSF_DOORBELL(uint32_t db) { return 0x80000u + db * 0x10000u; }
+/* Valhall CSF User MMIO page: monotonic hardware flush ID register */
+constexpr uint32_t CSF_GPU_LATEST_FLUSH_ID = 0x10000u;
 
 struct __attribute__((packed)) GfIpiMsg {
     uint32_t magic, cmd, target, reserved;
@@ -444,7 +460,8 @@ struct MaliHwSlot {
 /* ---- Global Mali-G615 hardware state (owned by Tb375fcMali service) ---- */
 struct MaliHwState {
     IOLock *lock;      /* Protects AS0 arena & global doorbell 0 */
-    IOLock *schedLock; /* Protects hw slots[0..6], AS1..7, CSG0..6 (ALWAYS acquired BEFORE client->fLock) */
+    IOLock *schedLock; /* Protects hw slots[1..6], AS2..7, CSG1..6 (ALWAYS acquired BEFORE client->fLock) */
+    IOLock *wsLock;    /* Dedicated lightweight lock for pinned Slot 0 (WindowServer) so non-WS evictions NEVER stall WS/display */
     bool    ready;
     MappedPage gpuebGpr, gpuebMbox, mfgRpc, gpuebDram, maliReg;
     IOBufferMemoryDescriptor *csfArenaDesc;
@@ -465,7 +482,12 @@ struct MaliHwState {
     uint64_t useClock;
     uint32_t evictCount;
     uint32_t resumeCount;
-    uint64_t sharedKmemBytes; /* Global kmem_io WC budget across all clients (capped at 64 MiB) */
+    uint64_t sharedKmemBytes; /* Global kmem_io WC budget across all clients (capped at 512 MiB of 1985 MiB DATA_SHARED) */
+    IOBufferMemoryDescriptor *faultScratchDesc;
+    uint64_t faultScratchPa;
+    uint32_t mmuFaultCount;
+    Tb375fcMaliUserClient *wsClient;
+    uint32_t wsGroupIdx;
     MaliHwSlot slots[kMaxHwSlots];
     Tb375fcMaliDevInfo devInfo;
 };
@@ -596,7 +618,7 @@ static bool ensureSlotAs0Buffers(uint32_t slotIdx, uint32_t /*queueCount*/) {
 
 /* ---- 4-Level ARM_64_LPAE_S1 Page Table for User VMs (On-Demand 128 KiB Chunks) ---- */
 constexpr uint32_t kPtPagesPerChunk = 32u;  /* 128 KiB per chunk */
-constexpr uint32_t kMaxPtChunks     = 96u;  /* up to 3072 PT pages = 12 MiB max per VM */
+constexpr uint32_t kMaxPtChunks     = 192u; /* up to 6144 PT pages = 24 MiB max per VM */
 constexpr uint32_t kMaxPtPagesPerVm = kPtPagesPerChunk * kMaxPtChunks;
 
 struct MaliVm {
@@ -608,6 +630,7 @@ struct MaliVm {
     uint32_t ptChunksAlloc;
     uint64_t *ptPagePas;
     uint32_t ptPagesUsed;
+    uint32_t faultRecoveries;
     uint64_t l0Pa;
     uint64_t *l0Va;
     uint64_t nextInternalVa;
@@ -694,57 +717,108 @@ static uint64_t *vmPaToVa(MaliVm *vm, uint64_t pa) {
     return nullptr;
 }
 
-static bool vmMapPage(MaliVm *vm, uint64_t va, uint64_t pa, uint32_t flags) {
-    uint32_t i0 = static_cast<uint32_t>((va >> 39) & 0x1FFu);
-    uint32_t i1 = static_cast<uint32_t>((va >> 30) & 0x1FFu);
-    uint32_t i2 = static_cast<uint32_t>((va >> 21) & 0x1FFu);
-    uint32_t i3 = static_cast<uint32_t>((va >> 12) & 0x1FFu);
-
+static uint64_t *vmEnsureL3Table(MaliVm *vm, uint64_t va, bool create) {
+    uint32_t idxs[3] = {
+        static_cast<uint32_t>((va >> 39) & 0x1FFu),
+        static_cast<uint32_t>((va >> 30) & 0x1FFu),
+        static_cast<uint32_t>((va >> 21) & 0x1FFu),
+    };
     uint64_t *tbl = vm->l0Va;
-    uint32_t idxs[3] = { i0, i1, i2 };
     for (int lvl = 0; lvl < 3; ++lvl) {
         uint64_t e = tbl[idxs[lvl]];
         if ((e & 0x3ULL) != 0x3ULL) {
+            if (!create) return nullptr;
             uint64_t childPa = 0;
             uint64_t *childVa = nullptr;
-            if (vmAllocPtPage(vm, &childPa, &childVa) == UINT32_MAX) return false;
+            if (vmAllocPtPage(vm, &childPa, &childVa) == UINT32_MAX) return nullptr;
             tbl[idxs[lvl]] = (childPa & 0x0000FFFFFFFFF000ULL) | 0x3ULL;
             cacheFlushRange(&tbl[idxs[lvl]], sizeof(uint64_t));
             tbl = childVa;
         } else {
             tbl = vmPaToVa(vm, e);
-            if (!tbl) return false;
+            if (!tbl) return nullptr;
         }
     }
+    return tbl;
+}
+
+static inline uint64_t vmMakeLeafPte(uint64_t pa, uint32_t flags) {
     uint64_t pte = (pa & 0x0000FFFFFFFFF000ULL) | 0x3ULL | (1ULL << 10) | (1ULL << 6);
     if (flags & MALI_VM_MAP_READONLY) pte |= (1ULL << 7);
     if (flags & MALI_VM_MAP_NOEXEC)   pte |= (1ULL << 54);
     if (flags & MALI_VM_MAP_UNCACHED) pte |= (0ULL << 2) | (2ULL << 8);
     else                              pte |= (1ULL << 2) | (3ULL << 8);
-    tbl[i3] = pte;
-    cacheFlushRange(&tbl[i3], sizeof(uint64_t));
+    return pte;
+}
+
+static bool vmMapPage(MaliVm *vm, uint64_t va, uint64_t pa, uint32_t flags) {
+    uint64_t *l3 = vmEnsureL3Table(vm, va, true);
+    if (!l3) return false;
+    uint32_t i3 = static_cast<uint32_t>((va >> 12) & 0x1FFu);
+    l3[i3] = vmMakeLeafPte(pa, flags);
+    cacheFlushRange(&l3[i3], sizeof(uint64_t));
     return true;
 }
 
-static void vmUnmapPage(MaliVm *vm, uint64_t va) {
-    uint32_t idxs[4] = {
-        static_cast<uint32_t>((va >> 39) & 0x1FFu),
-        static_cast<uint32_t>((va >> 30) & 0x1FFu),
-        static_cast<uint32_t>((va >> 21) & 0x1FFu),
-        static_cast<uint32_t>((va >> 12) & 0x1FFu),
-    };
-    uint64_t *tbl = vm->l0Va;
-    for (int lvl = 0; lvl < 3; ++lvl) {
-        uint64_t e = tbl[idxs[lvl]];
-        if ((e & 0x3ULL) != 0x3ULL) return;
-        tbl = vmPaToVa(vm, e);
-        if (!tbl) return;
+/* Fast batched range mapper: walks L0->L1->L2->L3 once per 2 MiB L3 chunk, consumes full
+ * contiguous getPhysicalSegment runs, and issues ONE cacheFlushRange per L3 span (100x+ faster). */
+static bool vmMapRange(MaliVm *vm, uint64_t va, IOMemoryDescriptor *desc,
+                       uint64_t boOff, uint64_t totalPages, uint32_t flags,
+                       uint64_t *failPageOut = nullptr, uint64_t *failPaOut = nullptr) {
+    uint64_t p = 0;
+    uint64_t segPa = 0;
+    uint64_t segRemPages = 0;
+    while (p < totalPages) {
+        uint64_t curVa = va + p * 4096ULL;
+        uint64_t *l3 = vmEnsureL3Table(vm, curVa, true);
+        if (!l3) {
+            if (failPageOut) *failPageOut = p;
+            if (failPaOut)   *failPaOut   = 0;
+            return false;
+        }
+        uint32_t i3Start = static_cast<uint32_t>((curVa >> 12) & 0x1FFu);
+        uint64_t chunkPages = 512ULL - i3Start;
+        if (chunkPages > totalPages - p) chunkPages = totalPages - p;
+        for (uint64_t k = 0; k < chunkPages; ++k) {
+            if (segRemPages == 0) {
+                IOByteCount segLen = 0;
+                segPa = static_cast<uint64_t>(
+                    desc->getPhysicalSegment(static_cast<IOByteCount>(boOff + (p + k) * 4096ULL), &segLen));
+                if (!segPa) {
+                    if (k > 0) cacheFlushRange(&l3[i3Start], static_cast<size_t>(k) * sizeof(uint64_t));
+                    if (failPageOut) *failPageOut = p + k;
+                    if (failPaOut)   *failPaOut   = 0;
+                    return false;
+                }
+                segRemPages = (segLen >= 4096ULL) ? (segLen / 4096ULL) : 1ULL;
+            }
+            l3[i3Start + k] = vmMakeLeafPte(segPa, flags);
+            segPa += 4096ULL;
+            segRemPages--;
+        }
+        cacheFlushRange(&l3[i3Start], static_cast<size_t>(chunkPages) * sizeof(uint64_t));
+        p += chunkPages;
     }
-    tbl[idxs[3]] = 0;
-    cacheFlushRange(&tbl[idxs[3]], sizeof(uint64_t));
+    return true;
 }
 
-static void hwFlushAs(uint32_t as) {
+static void vmUnmapRange(MaliVm *vm, uint64_t va, uint64_t totalPages) {
+    uint64_t p = 0;
+    while (p < totalPages) {
+        uint64_t curVa = va + p * 4096ULL;
+        uint32_t i3Start = static_cast<uint32_t>((curVa >> 12) & 0x1FFu);
+        uint64_t chunkPages = 512ULL - i3Start;
+        if (chunkPages > totalPages - p) chunkPages = totalPages - p;
+        uint64_t *l3 = vmEnsureL3Table(vm, curVa, false);
+        if (l3) {
+            memset(&l3[i3Start], 0, static_cast<size_t>(chunkPages) * sizeof(uint64_t));
+            cacheFlushRange(&l3[i3Start], static_cast<size_t>(chunkPages) * sizeof(uint64_t));
+        }
+        p += chunkPages;
+    }
+}
+
+static void hwFlushAs(uint32_t as, bool flushMem = false) {
     if (as == 0 || as >= 8u) return;
     wr64(gMali.maliReg.va, AS_REG(as, AS_LOCKADDR_LO), 47ULL);
     wr32(gMali.maliReg.va, AS_REG(as, AS_COMMAND), AS_CMD_LOCK);
@@ -752,7 +826,7 @@ static void hwFlushAs(uint32_t as) {
         if ((rd32(gMali.maliReg.va, AS_REG(as, AS_STATUS)) & 1u) == 0u) break;
         IODelay(5);
     }
-    wr32(gMali.maliReg.va, AS_REG(as, AS_COMMAND), AS_CMD_FLUSH_PT);
+    wr32(gMali.maliReg.va, AS_REG(as, AS_COMMAND), flushMem ? AS_CMD_FLUSH_MEM : AS_CMD_FLUSH_PT);
     for (int i = 0; i < 1000; ++i) {
         if ((rd32(gMali.maliReg.va, AS_REG(as, AS_STATUS)) & 1u) == 0u) break;
         IODelay(5);
@@ -843,6 +917,11 @@ static bool initMaliHardware(void) {
 
         uint32_t boostEn = 1u;
         PE_parse_boot_argn("boost", &boostEn, sizeof(boostEn));
+        uint32_t gpuMhzArg = 1400u; /* Stock Dimensity 8300 OPP0 (1400 MHz, +16% fill/shader vs 1206; safe with noafbc + MMU healer); override via gpumhz=1206 */
+        PE_parse_boot_argn("gpumhz", &gpuMhzArg, sizeof(gpuMhzArg));
+        if (gpuMhzArg < 300u) gpuMhzArg = 300u;
+        if (gpuMhzArg > 1400u) gpuMhzArg = 1400u;
+        const uint32_t targetGpuKhz = gpuMhzArg * 1000u;
 
         if (boostEn && gpuOppN > 0 && gpuOppN <= 128) {
             uint32_t bestIdx = gpuOppN / 2u;
@@ -862,7 +941,7 @@ static bool initMaliHardware(void) {
                     if (idx == gpuOppN / 2u) fMid = fk;
                     if (idx == gpuOppN - 1u) fEnd = fk;
                     if (fk >= 200000u && fk <= 1500000u) {
-                        uint32_t diff = (fk > 1400000u) ? (fk - 1400000u) : (1400000u - fk);
+                        uint32_t diff = (fk > targetGpuKhz) ? (fk - targetGpuKhz) : (targetGpuKhz - fk);
                         if (diff < bestDiff) { bestDiff = diff; bestIdx = idx; bestFreq = fk; }
                     }
                 }
@@ -895,7 +974,7 @@ static bool initMaliHardware(void) {
             }
         }
 
-        MappedPage pllMap = {}, csramMap = {};
+        MappedPage pllMap = {}, csramMap = {}, mcuCfgMap = {};
         auto logPll = [&](const char *tag) {
             if (!pllMap.va) return;
             static const uint32_t offs[4] = {0x00cu, 0x40cu, 0x80cu, 0xc0cu};
@@ -904,20 +983,47 @@ static bool initMaliHardware(void) {
                 raw[i] = rd32(pllMap.va, offs[i]);
                 uint32_t pcw = raw[i] & 0x3fffffu;
                 uint32_t posdiv = (raw[i] >> 24) & 0x7u;
-                mhz[i] = (uint32_t)((26ULL * pcw) >> (14u + posdiv));
+                mhz[i] = (uint32_t)((52ULL * pcw) >> (14u + posdiv)); /* MT6897 ARMPLL 52 MHz effective fin */
             }
-            IOLog("Tb375fcMali: CPU PLL (%s) MHz: cci=%u cl0=%u cl1=%u cl2=%u\n",
-                  tag, mhz[0], mhz[1], mhz[2], mhz[3]);
+            uint32_t div[4] = {};
+            if (mcuCfgMap.va) {
+                div[0] = rd32(mcuCfgMap.va, 0x100u);
+                div[1] = rd32(mcuCfgMap.va, 0x10cu);
+                div[2] = rd32(mcuCfgMap.va, 0x118u);
+                div[3] = rd32(mcuCfgMap.va, 0x124u);
+            }
+            IOLog("Tb375fcMali: CPU PLL (%s) MHz: cci=%u cl0=%u cl1=%u cl2=%u | raw=0x%x/0x%x/0x%x/0x%x div=0x%x/0x%x/0x%x/0x%x\n",
+                  tag, mhz[0], mhz[1], mhz[2], mhz[3],
+                  raw[0], raw[1], raw[2], raw[3],
+                  div[0], div[1], div[2], div[3]);
         };
         mapMmio(0x0c030000ULL, 0x1000u, &pllMap);
+        mapMmio(0x0c000000ULL, 0x1000u, &mcuCfgMap);
         logPll("before");
 
         if (mapMmio(0x0011b000ULL, 0x2000u, &csramMap)) {
+            uint32_t freqScaleFlag = rd32(csramMap.va, 0xc00u + 0x4ccu); /* REG_FREQ_SCALING @ csram+0x4cc */
+            uint32_t cciModeBefore = rd32(csramMap.va, 0xc00u + 0xf9cu); /* OFFS_CCI_TBL_MODE @ csram+0xf9c */
+            uint32_t cpuBoostArg = 1u;
+            PE_parse_boot_argn("cpuboost", &cpuBoostArg, sizeof(cpuBoostArg));
             static const uint32_t domOff[3] = {0xc10u, 0xd30u, 0xe50u};
-            static const uint32_t targetMhz[3] = {2000u, 2800u, 3000u};
+            /* Full MT6897 Dimensity 8300 max OPPs (L=2200, M=3200, B=3350 MHz) when cpuboost=1 */
+            const uint32_t targetMhz[3] = {
+                cpuBoostArg ? 2200u : 2000u,
+                cpuBoostArg ? 3200u : 2800u,
+                cpuBoostArg ? 3350u : 3000u,
+            };
+            if (boostEn && cpuBoostArg) {
+                /* Set CCI/DSU performance table mode = 1 (70% ratio instead of Normal 50%) */
+                wr32(csramMap.va, 0xc00u + 0xf9cu, 1u);
+            }
+            IOLog("Tb375fcMali: CPUHW freqScale=0x%x cciMode=%u->%u\n",
+                  freqScaleFlag, cciModeBefore, rd32(csramMap.va, 0xc00u + 0xf9cu));
             for (int d = 0; d < 3; ++d) {
                 uintptr_t base = csramMap.va + domOff[d];
                 uint32_t en = rd32(base, 0x84u);
+                uint32_t hwSt = rd32(base, 0x8cu);
+                uint32_t l0 = rd32(base, 0x00u), l1 = rd32(base, 0x04u), l2 = rd32(base, 0x08u);
                 if (boostEn) {
                     uint32_t bestIdx = 0xFFFFFFFFu, bestDiff = 0xFFFFFFFFu, bestVal = 0u, prev = 0xFFFFFFFFu;
                     for (uint32_t i = 0; i < 32u; ++i) {
@@ -933,8 +1039,11 @@ static bool initMaliHardware(void) {
                     }
                     if (bestIdx != 0xFFFFFFFFu) {
                         if (!en) wr32(base, 0x84u, 1u);
-                        wr32(base, 0x88u, bestIdx);
-                        IOLog("Tb375fcMali: CPUHW dom%d -> set idx=%u (%u MHz)\n", d, bestIdx, bestVal);
+                        uint32_t writeVal = freqScaleFlag ? (bestVal * 1000u) : bestIdx;
+                        wr32(base, 0x88u, writeVal);
+                        IOLog("Tb375fcMali: CPUHW dom%d -> set %s=%u (%u MHz) lut0..2=%u/%u/%u hwSt=0x%x\n",
+                              d, freqScaleFlag ? "kHz" : "idx", writeVal, bestVal,
+                              l0 & 0xFFFu, l1 & 0xFFFu, l2 & 0xFFFu, hwSt);
                     }
                 }
             }
@@ -942,6 +1051,7 @@ static bool initMaliHardware(void) {
             unmapMmio(&csramMap);
         }
         logPll("after");
+        if (mcuCfgMap.va) unmapMmio(&mcuCfgMap);
         unmapMmio(&pllMap);
 
         /* MT6897 DVFSRC (0x1C00F000): Preloader/LK boots LPDDR5X at 3094 Mbps with DVFSRC disabled (bctl=0x8).
@@ -1260,6 +1370,15 @@ static bool initMaliHardware(void) {
         }
     }
 
+    /* Allocate a single zeroed 4 KiB physical scratch page for MMU page-fault self-healing */
+    gMali.faultScratchDesc = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut, 4096, 4096);
+    if (gMali.faultScratchDesc && gMali.faultScratchDesc->prepare() == kIOReturnSuccess) {
+        memset(gMali.faultScratchDesc->getBytesNoCopy(), 0, 4096);
+        cacheFlushRange(gMali.faultScratchDesc->getBytesNoCopy(), 4096);
+        IOByteCount segLen = 0;
+        gMali.faultScratchPa = static_cast<uint64_t>(gMali.faultScratchDesc->getPhysicalSegment(0, &segLen));
+    }
+
     gMali.ready = true;
     IOLog("Tb375fcMali: READY (multi-proc) gpu_id=0x%08x shader=0x%llx coh=0x%x fw=0x%08x csg=%u mcu=%u\n",
           di.gpu_id, (unsigned long long)di.shader_present, di.coherency_features,
@@ -1387,11 +1506,15 @@ static void evictHwSlotLocked(uint32_t slotIdx, bool permanent) {
     }
     IOLockUnlock(owner->fLock);
 
-    /* 1. Drain in-flight packets on all queues of this slot so victim finishes cleanly (up to 1.5s) */
+    /* 1. Brief drain on victim queues before SUSPEND/TERMINATE:
+     * Mali CSF natively suspends in-flight CSGs via CSG_STATE_SUSPEND and resumes them cleanly on
+     * CSG_STATE_RESUME, so LRU eviction (permanent==false) only waits 20ms (not 1500ms!) to avoid
+     * stalling other apps waiting on gMali.schedLock. */
     bool allDone = true;
     if (qCount > 0 && gMali.devInfo.mcu_alive) {
         allDone = false;
-        for (int ms = 0; ms < 1500; ++ms) {
+        const int drainMaxMs = permanent ? 200 : 20;
+        for (int ms = 0; ms < drainMaxMs; ++ms) {
             bool done = true;
             for (uint32_t q = 0; q < qCount; ++q) {
                 if (!ioOuts[q] || targets[q] == 0) continue;
@@ -1513,6 +1636,14 @@ static void evictHwSlotLocked(uint32_t slotIdx, bool permanent) {
     }
     IOLockUnlock(owner->fLock);
 
+    if (slotIdx == 0u && gMali.wsLock) {
+        IOLockLock(gMali.wsLock);
+        if (gMali.wsClient == owner && gMali.wsGroupIdx == grpIdx) {
+            gMali.wsClient   = nullptr;
+            gMali.wsGroupIdx = 0u;
+        }
+        IOLockUnlock(gMali.wsLock);
+    }
     slot.ownerClient   = nullptr;
     slot.ownerGroupIdx = 0;
     slot.ownerVmIdx    = 0;
@@ -1646,7 +1777,20 @@ static int32_t ensureGroupResidentLocked(Tb375fcMaliUserClient *client, uint32_t
     if (maxC > 5u) maxC = 5u;
     if (maxF > 5u) maxF = 5u;
     maxT        = 1u; /* Mali-G615 has exactly 1 tiler; never ask MCU for 5 tilers */
-    grpPrio     = client->fIsWindowServer ? 2u : 1u; /* Prioritize WindowServer CSG0 over background apps while GLB_IDLE_EN shares endpoints */
+    /* Give WindowServer CSF priority 2 (overrideable via wsprio=1..3) and cap non-WS Fragment
+     * cores to 4/5 (overrideable via bgmaxf=1..5) so dynamic wallpaper / background apps never
+     * starve WindowServer compositing or delay ws-display-sync! */
+    static uint32_t sWsPrio = 0u, sBgMaxF = 0u;
+    if (sWsPrio == 0u) {
+        uint32_t p = 2u;
+        if (PE_parse_boot_argn("wsprio", &p, sizeof(p)) && p >= 1u && p <= 3u) sWsPrio = p;
+        else sWsPrio = 2u;
+        uint32_t bf = 4u;
+        if (PE_parse_boot_argn("bgmaxf", &bf, sizeof(bf)) && bf >= 1u && bf <= 5u) sBgMaxF = bf;
+        else sBgMaxF = 4u;
+    }
+    if (!client->fIsWindowServer && maxF > sBgMaxF) maxF = sBgMaxF;
+    grpPrio     = client->fIsWindowServer ? sWsPrio : 1u;
     grpSuspFwVa = g.suspendFwVa ? g.suspendFwVa : slot.fallbackSuspFwVa;
     resuming    = g.hw_suspended && (g.suspendFwVa != 0u);
 
@@ -1773,7 +1917,116 @@ static int32_t ensureGroupResidentLocked(Tb375fcMaliUserClient *client, uint32_t
     client->fGroups[grpIdx].hw_suspended = false;
     __atomic_store_n(&client->fGroups[grpIdx].hw_slot, static_cast<int32_t>(chosen), __ATOMIC_RELEASE);
     IOLockUnlock(client->fLock);
+
+    if (slot.pinnedWs && gMali.wsLock) {
+        IOLockLock(gMali.wsLock);
+        gMali.wsClient   = client;
+        gMali.wsGroupIdx = grpIdx;
+        IOLockUnlock(gMali.wsLock);
+    }
     return static_cast<int32_t>(chosen);
+}
+
+/* Detect, log, and self-heal any live Mali-G615 MMU page fault on AS1..AS7 (bits 1..7 of MMU_INT_RAWSTAT).
+ * On Mali CSF, an unhandled AS page fault stalls that AS forever and locks up all Fragment cores held by
+ * its CSG (causing the entire desktop to freeze). Mapping a zeroed scratch page on translation faults +
+ * issuing MMU_INT_CLEAR & AS_CMD_UNLOCK lets the faulting draw finish harmlessly while logging exact VA! */
+static bool checkAndRecoverMmuFaults(const char *tag) {
+    if (!gMali.ready || !gMali.maliReg.va || !gMali.schedLock) return false;
+    uintptr_t mv = gMali.maliReg.va;
+    uint32_t mmuIrq = rd32(mv, MMU_INT_RAWSTAT);
+    if ((mmuIrq & 0xFEu) == 0u) return false;
+
+    IOLockLock(gMali.schedLock);
+    mmuIrq = rd32(mv, MMU_INT_RAWSTAT);
+    uint32_t faultMask = mmuIrq & 0xFEu;
+    if (faultMask == 0u) {
+        IOLockUnlock(gMali.schedLock);
+        return false;
+    }
+
+    uint32_t shRdy  = rd32(mv, 0x0140u);
+    uint32_t tlRdy  = rd32(mv, 0x0150u);
+    uint32_t gpuFlt = rd32(mv, 0x003Cu);
+
+    for (uint32_t asSlot = 1u; asSlot <= kMaxHwSlots; ++asSlot) {
+        if ((faultMask & (1u << asSlot)) == 0u) continue;
+        uint32_t csgSlot = asSlot - 1u;
+        uint32_t asFlt   = rd32(mv, AS_REG(asSlot, AS_FAULTSTATUS));
+        uint64_t asAddr  = static_cast<uint64_t>(rd32(mv, AS_REG(asSlot, AS_FAULTADDR_LO))) |
+                           (static_cast<uint64_t>(rd32(mv, AS_REG(asSlot, AS_FAULTADDR_HI))) << 32);
+
+        MaliHwSlot &slot = gMali.slots[csgSlot];
+        Tb375fcMaliUserClient *owner = slot.ownerClient;
+        const char *proc = owner ? owner->fProcName : "<none>";
+        uint32_t vmIdx   = slot.ownerVmIdx;
+        uint32_t grpIdx  = slot.ownerGroupIdx;
+
+        uint32_t fnum = ++gMali.mmuFaultCount;
+        bool mappedScratch = false;
+        uint32_t vmRecs = 0;
+
+        if (owner && owner->fLock && owner->fVms && vmIdx > 0u && vmIdx < kMaxClientVms) {
+            IOLockLock(owner->fLock);
+            MaliVm &vm = owner->fVms[vmIdx];
+            if (vm.in_use && gMali.faultScratchPa != 0ULL &&
+                (asAddr & ~4095ULL) != 0ULL && asAddr < 0x0000FFFFFFFF0000ULL &&
+                vm.faultRecoveries < 64u) {
+                /* Map faulting page to zeroed scratch page so MMU replay completes harmlessly */
+                if (vmMapPage(&vm, asAddr & ~4095ULL, gMali.faultScratchPa,
+                              MALI_VM_MAP_NOEXEC | MALI_VM_MAP_UNCACHED)) {
+                    vm.faultRecoveries++;
+                    mappedScratch = true;
+                }
+            }
+            vmRecs = vm.faultRecoveries;
+            IOLockUnlock(owner->fLock);
+        }
+
+        if (fnum <= 32u || (fnum % 64u) == 0u) {
+            IOLog("Tb375fcMali: MMU FAULT #%u [%s] as=%u csg=%u proc=%s flt=0x%x@0x%llx gpuFlt=0x%x mmu=0x%x shRdy=0x%x tlRdy=0x%x scratch=%u(%u)\n",
+                  fnum, tag ? tag : "?", asSlot, csgSlot, proc, asFlt, (unsigned long long)asAddr,
+                  gpuFlt, mmuIrq, shRdy, tlRdy, mappedScratch ? 1u : 0u, vmRecs);
+            if (owner && owner->fGroups && grpIdx > 0u && grpIdx < kMaxClientGroups) {
+                uint32_t qc = owner->fGroups[grpIdx].queue_count;
+                if (qc > MALI_MAX_QUEUES_PER_GROUP) qc = MALI_MAX_QUEUES_PER_GROUP;
+                for (uint32_t qi = 0u; qi < qc; ++qi) {
+                    FwCsControl *cc = getCsCtrl(csgSlot, qi);
+                    FwCsOutput  *co = cc ? reinterpret_cast<FwCsOutput *>(fwVaToCpu(cc->output_va)) : nullptr;
+                    if (co) {
+                        cacheFlushRange(co, sizeof(*co));
+                        IOLog("Tb375fcMali:   fault-csg%u q[%u] cmd=0x%llx blk=%u wait=0x%x sb=0x%x flt=0x%x(0x%llx) ftl=0x%x(0x%llx)\n",
+                              csgSlot, qi, (unsigned long long)co->status_cmd_ptr, co->status_blocked_reason,
+                              co->status_wait, co->status_scoreboards,
+                              co->fault, (unsigned long long)co->fault_info,
+                              co->fatal, (unsigned long long)co->fatal_info);
+                    }
+                }
+            }
+        }
+
+        if (asSlot == 1u && gMali.wsLock) IOLockLock(gMali.wsLock);
+        if (mappedScratch) {
+            hwFlushAs(asSlot, true);
+        }
+        wr32(mv, MMU_INT_CLEAR, (1u << asSlot));
+        wr32(mv, AS_REG(asSlot, AS_COMMAND), AS_CMD_UNLOCK);
+        for (int i = 0; i < 1000; ++i) {
+            if ((rd32(mv, AS_REG(asSlot, AS_STATUS)) & 1u) == 0u) break;
+            IODelay(5);
+        }
+        if (asSlot == 1u && gMali.wsLock) IOLockUnlock(gMali.wsLock);
+
+        /* Terminate runaway non-WindowServer CSGs that keep faulting */
+        if (owner && !owner->fIsWindowServer && vmRecs >= 8u && slot.ownerClient == owner) {
+            IOLog("Tb375fcMali: terminating runaway faulting proc=%s on csg=%u (faults=%u)\n",
+                  proc, csgSlot, vmRecs);
+            evictHwSlotLocked(csgSlot, true);
+        }
+    }
+
+    IOLockUnlock(gMali.schedLock);
+    return true;
 }
 
 } // namespace
@@ -1946,22 +2199,21 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         if (sz == 0 || sz > 512ULL * 1024ULL * 1024ULL) return kIOReturnBadArgument;
 
         IOBufferMemoryDescriptor *desc = nullptr;
-        /* Reserve hardware WriteCombine kIOMemoryKernelUserShared strictly within 48 MiB out of
-         * XNU's 128 MiB KMEM_RANGE_ID_DATA_SHARED pool so AppleFSCompression / IOSurface / IOKit
-         * ALWAYS have >= 80 MiB of DATA_SHARED free (prevents kmem_alloc KERN_NO_SPACE crashes!).
-         * WS gets up to 24 MiB (BOs <= 2 MiB); non-WS gets up to 3 MiB (BOs <= 512 KiB for PanVK
-         * sync_bo/cs_bo/desc_bo/shaders). Larger BOs cleanly fall back to single-mapping anon mmap. */
+        /* Live Boot 155 verified kmem_data_shared_range = 2,113 MiB!
+         * On Boot 155, iconservicesagent exceeded the 32 MiB non-WS cap (m=81 MB -> 17.7 ms dc cvac)
+         * and WindowServer reached 684 MB RSS. Raise WC caps to 32 MiB/BO, 256 MiB WS, 128 MiB non-WS,
+         * 1024 MiB global (still leaving >1,080 MiB of DATA_SHARED free) so zero apps fall back to dc cvac! */
         bool allowShared = false;
-        uint64_t maxSingleShared = fIsWindowServer ? (16ULL * 1024ULL * 1024ULL) : (1024ULL * 1024ULL);
+        uint64_t maxSingleShared = 32ULL * 1024ULL * 1024ULL;
         if ((in->flags & MALI_BO_NO_MMAP) == 0 && sz <= maxSingleShared) {
             IOLockLock(fLock);
             bool clientOk = fIsWindowServer
-                ? (fSharedBytes + sz <= 48ULL * 1024ULL * 1024ULL)
-                : (fSharedBytes + sz <= 4ULL * 1024ULL * 1024ULL);
+                ? (fSharedBytes + sz <= 256ULL * 1024ULL * 1024ULL)
+                : (fSharedBytes + sz <= 128ULL * 1024ULL * 1024ULL);
             IOLockUnlock(fLock);
             if (clientOk) {
                 IOLockLock(gMali.lock);
-                if (gMali.sharedKmemBytes + sz <= 64ULL * 1024ULL * 1024ULL) {
+                if (gMali.sharedKmemBytes + sz <= 1024ULL * 1024ULL * 1024ULL) {
                     gMali.sharedKmemBytes += sz;
                     allowShared = true;
                 }
@@ -1995,7 +2247,7 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
                 return kIOReturnNoMemory;
             }
             /* Zero & clean NO_MMAP BOs to DRAM so GPU never reads stale uninitialized lines */
-            if (sz <= 16ULL * 1024ULL * 1024ULL) {
+            if (sz <= 64ULL * 1024ULL * 1024ULL) {
                 IOMemoryMap *kmap = desc->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
                 if (kmap) {
                     void *va = reinterpret_cast<void *>(kmap->getVirtualAddress());
@@ -2191,36 +2443,45 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
 
         uint64_t pages = (in->size + 4095ULL) / 4096ULL;
         if (in->op == MALI_VM_BIND_UNMAP) {
-            for (uint64_t p = 0; p < pages; ++p) vmUnmapPage(&vm, in->va + p * 4096ULL);
+            vmUnmapRange(&vm, in->va, pages);
         } else {
             if (in->bo_handle == 0 || in->bo_handle >= kMaxClientBos || !fBos[in->bo_handle].in_use) {
                 IOLockUnlock(fLock);
                 return kIOReturnNotFound;
             }
             IOMemoryDescriptor *desc = fBos[in->bo_handle].desc;
-            for (uint64_t p = 0; p < pages; ++p) {
-                IOByteCount segLen = 0;
-                uint64_t pa = static_cast<uint64_t>(
-                    desc->getPhysicalSegment(static_cast<IOByteCount>(in->bo_offset + p * 4096ULL), &segLen));
-                if (!pa || !vmMapPage(&vm, in->va + p * 4096ULL, pa, in->flags)) {
-                    IOLockUnlock(fLock);
-                    return kIOReturnNoMemory;
-                }
+            uint64_t failP = 0, failPa = 0;
+            if (!vmMapRange(&vm, in->va, desc, in->bo_offset, pages, in->flags, &failP, &failPa)) {
+                uint32_t usedPt = vm.ptPagesUsed;
+                IOLockUnlock(fLock);
+                IOLog("Tb375fcMali: VM_BIND FAIL proc=%s vm=%u bo=%u va=0x%llx off=0x%llx sz=0x%llx p=%llu pa=0x%llx pt=%u/%u\n",
+                      fProcName, in->vm_id, in->bo_handle, (unsigned long long)in->va,
+                      (unsigned long long)in->bo_offset, (unsigned long long)in->size,
+                      (unsigned long long)failP, (unsigned long long)failPa, usedPt, kMaxPtPagesPerVm);
+                return kIOReturnNoMemory;
             }
         }
         uint32_t asMask = vm.as_slot_mask;
         IOLockUnlock(fLock);
 
         if (asMask) {
-            IOLockLock(gMali.schedLock);
-            for (uint32_t s = 0; s < kMaxHwSlots; ++s) {
-                if ((asMask & (1u << (s + 1u))) &&
-                    gMali.slots[s].ownerClient == this &&
-                    gMali.slots[s].ownerVmIdx == in->vm_id) {
-                    hwFlushAs(s + 1u);
+            bool isUnmap = (in->op == MALI_VM_BIND_UNMAP);
+            if (fIsWindowServer && (asMask == (1u << 1u)) && gMali.wsLock) {
+                /* Fast path for WindowServer's pinned AS1: serialize on wsLock, never block on schedLock */
+                IOLockLock(gMali.wsLock);
+                hwFlushAs(1u, isUnmap);
+                IOLockUnlock(gMali.wsLock);
+            } else {
+                IOLockLock(gMali.schedLock);
+                for (uint32_t s = 0; s < kMaxHwSlots; ++s) {
+                    if ((asMask & (1u << (s + 1u))) &&
+                        gMali.slots[s].ownerClient == this &&
+                        gMali.slots[s].ownerVmIdx == in->vm_id) {
+                        hwFlushAs(s + 1u, isUnmap);
+                    }
                 }
+                IOLockUnlock(gMali.schedLock);
             }
-            IOLockUnlock(gMali.schedLock);
         }
         return kIOReturnSuccess;
     }
@@ -2235,8 +2496,8 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         if (chunkSz < 128u * 1024u) chunkSz = 256u * 1024u;
         uint32_t cnt = in->initial_chunk_count ? in->initial_chunk_count : 4u;
         if (fIsWindowServer) {
-            if (cnt < 8u) cnt = 8u;
-            if (cnt > 16u) cnt = 16u;
+            if (cnt < 16u) cnt = 16u;
+            if (cnt > 24u) cnt = 24u;
         } else {
             if (cnt < 4u) cnt = 4u;
             if (cnt > 8u) cnt = 8u;
@@ -2267,14 +2528,10 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         }
         uint64_t baseVa = vm.nextInternalVa;
         vm.nextInternalVa += (totalSz + 0xFFFFFULL) & ~0xFFFFFULL;
-        for (uint64_t off = 0; off < totalSz; off += 4096ULL) {
-            IOByteCount segLen = 0;
-            uint64_t pa = static_cast<uint64_t>(desc->getPhysicalSegment(static_cast<IOByteCount>(off), &segLen));
-            if (!pa || !vmMapPage(&vm, baseVa + off, pa, MALI_VM_MAP_NOEXEC)) {
-                IOLockUnlock(fLock);
-                kmap->release(); desc->complete(); desc->release();
-                return kIOReturnNoMemory;
-            }
+        if (!vmMapRange(&vm, baseVa, desc, 0ULL, totalSz / 4096ULL, MALI_VM_MAP_NOEXEC)) {
+            IOLockUnlock(fLock);
+            kmap->release(); desc->complete(); desc->release();
+            return kIOReturnNoMemory;
         }
         for (uint32_t c = 0; c < cnt; ++c) {
             uint64_t *hdr = reinterpret_cast<uint64_t *>(cpuBase + 4096ULL + static_cast<uint64_t>(c) * chunkSz);
@@ -2397,6 +2654,7 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
                     g.ringIoOutCpu[q]  = reinterpret_cast<FwRingIoOutput *>(ioBaseCpu + (q * 2u + 1u) * 4096u);
                     g.queuePrio[q] = in->queues[q].priority;
                     uint32_t rsz = in->queues[q].ringbuf_size;
+                    if (fIsWindowServer && rsz < 262144u) rsz = 262144u; /* 256 KiB = 2048 packets for WindowServer burst headroom */
                     if (rsz < 65536u) rsz = 65536u;
                     if (!fIsWindowServer && rsz > 65536u) rsz = 65536u;
                     if (rsz > 262144u) rsz = 262144u;
@@ -2497,11 +2755,20 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         uint32_t scnt = in->submit_count;
         if (scnt > MALI_MAX_SUBMITS_PER_CALL) scnt = MALI_MAX_SUBMITS_PER_CALL;
 
-        IOLockLock(gMali.schedLock);
-        int32_t slotIdx = ensureGroupResidentLocked(this, in->group_handle);
-        if (slotIdx < 0) {
-            IOLockUnlock(gMali.schedLock);
-            return kIOReturnNoResources;
+        /* Fast path for WindowServer's permanently pinned Slot 0 (CSG0/AS1/DB1):
+         * skip global gMali.schedLock completely so non-WS LRU evictions NEVER stall compositor! */
+        bool lockedSched = false;
+        int32_t slotIdx = -1;
+        if (fIsWindowServer && __atomic_load_n(&fGroups[in->group_handle].hw_slot, __ATOMIC_ACQUIRE) == 0) {
+            slotIdx = 0;
+        } else {
+            IOLockLock(gMali.schedLock);
+            lockedSched = true;
+            slotIdx = ensureGroupResidentLocked(this, in->group_handle);
+            if (slotIdx < 0) {
+                IOLockUnlock(gMali.schedLock);
+                return kIOReturnNoResources;
+            }
         }
         uint32_t dbId = static_cast<uint32_t>(slotIdx) + 1u;
 
@@ -2509,7 +2776,7 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         MaliGroupEntry &g = fGroups[in->group_handle];
         if (!g.in_use) {
             IOLockUnlock(fLock);
-            IOLockUnlock(gMali.schedLock);
+            if (lockedSched) IOLockUnlock(gMali.schedLock);
             return kIOReturnNotFound;
         }
 
@@ -2518,7 +2785,14 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
             uint64_t valReg  = addrReg + 2u;
             uint64_t waitAll = (gMali.devInfo.scoreboard_slot_count > 0 && gMali.devInfo.scoreboard_slot_count <= 16u)
                                ? ((1ULL << gMali.devInfo.scoreboard_slot_count) - 1ULL) : 0xFFULL;
+            /* Sample hardware CSF_GPU_LATEST_FLUSH_ID ONCE for this submit batch:
+             * The first active subqueue that executes FLUSH_CACHE2(0x233, batchFlushId)
+             * invalidates L2+LSC+OTHER and hardware increments CSF_GPU_LATEST_FLUSH_ID,
+             * so all other subqueues (q=1 FRAG, q=2 COMPUTE) in the same submit batch
+             * skip the duplicate full-L2 invalidate in hardware at zero cost! */
+            uint32_t batchFlushId = rd32(gMali.maliReg.va, CSF_GPU_LATEST_FLUSH_ID);
             uint32_t qFirstFlushed = 0u;
+            uint32_t qDirtyMask = 0u;
             uint32_t lastIdxForQ[MALI_MAX_QUEUES_PER_GROUP];
             for (uint32_t qi = 0; qi < MALI_MAX_QUEUES_PER_GROUP; ++qi) lastIdxForQ[qi] = UINT32_MAX;
             for (uint32_t s = 0; s < scnt; ++s) {
@@ -2528,36 +2802,44 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
                     lastIdxForQ[qq] = s;
                 }
             }
-            bool anyWritten = false;
             for (uint32_t s = 0; s < scnt; ++s) {
                 const Tb375fcMaliQueueSubmitDesc &sub = in->submits[s];
+                /* Mirror mainline Linux panthor_sched.c queue_run_job(): zero-size wait/signal
+                 * sync markers emit NO ringbuffer packet and NO pipeline-draining WAIT(waitAll). */
+                if (sub.stream_size == 0 || sub.stream_addr == 0) continue;
                 uint32_t q = sub.queue_index;
                 if (q >= g.queue_count) q = 0;
                 if (!g.ringDesc[q] || !g.ringIoInCpu[q]) continue;
 
-                uint64_t pkt[16];
+                /* 64-byte (8 x u64, 1 cacheline) ringbuffer packet:
+                 * Up to 3 entry-flush + 3 CALL + 2 end-of-batch WAIT(waitAll)+ERROR_BARRIER = 8.
+                 * Intermediate calls (e.g. 8B req_resource or multi-cmdbuf chunks) omit redundant
+                 * WAIT(waitAll) and end-of-batch 0x011 clean because panvk's finish_cs() already
+                 * emits cs_wait_slots(all) + cs_flush_caches(CLEAN, CLEAN, NONE, 0) per cmdbuf! */
+                uint64_t pkt[8];
                 memset(pkt, 0, sizeof(pkt));
                 uint32_t n = 0;
-                if (sub.stream_size > 0 && sub.stream_addr != 0) {
-                    if ((qFirstFlushed & (1u << q)) == 0u) {
-                        qFirstFlushed |= (1u << q);
-                        pkt[n++] = (2ULL << 56) | (valReg << 48) | static_cast<uint64_t>(sub.latest_flush);
-                        pkt[n++] = (36ULL << 56) | (0ULL << 48) | (valReg << 40) | (0ULL << 16) | 0x233ULL;
-                        pkt[n++] = (3ULL << 56) | (1ULL << 16);
-                    }
-                    pkt[n++] = (1ULL << 56) | (addrReg << 48) | (sub.stream_addr & 0x0000FFFFFFFFFFFFULL);
-                    pkt[n++] = (2ULL << 56) | (valReg << 48) | static_cast<uint64_t>(sub.stream_size);
-                    pkt[n++] = (32ULL << 56) | (addrReg << 40) | (valReg << 32);
-                    pkt[n++] = (3ULL << 56) | (waitAll << 16);
-                    if (s == lastIdxForQ[q]) {
-                        pkt[n++] = (2ULL << 56) | (valReg << 48);
-                        pkt[n++] = (36ULL << 56) | (0ULL << 48) | (valReg << 40) | (0ULL << 16) | 0x233ULL;
-                        pkt[n++] = (3ULL << 56) | (1ULL << 16);
-                    }
-                    pkt[n++] = (47ULL << 56);
-                } else {
+                if ((qFirstFlushed & (1u << q)) == 0u) {
+                    qFirstFlushed |= (1u << q);
+                    pkt[n++] = (2ULL << 56) | (valReg << 48) | static_cast<uint64_t>(batchFlushId);
+                    pkt[n++] = (36ULL << 56) | (0ULL << 48) | (valReg << 40) | (0ULL << 16) | 0x233ULL;
+                    pkt[n++] = (3ULL << 56) | (1ULL << 16);
+                }
+                pkt[n++] = (1ULL << 56) | (addrReg << 48) | (sub.stream_addr & 0x0000FFFFFFFFFFFFULL);
+                pkt[n++] = (2ULL << 56) | (valReg << 48) | static_cast<uint64_t>(sub.stream_size);
+                pkt[n++] = (32ULL << 56) | (addrReg << 40) | (valReg << 32);
+                if (s == lastIdxForQ[q]) {
                     pkt[n++] = (3ULL << 56) | (waitAll << 16);
                     pkt[n++] = (47ULL << 56);
+                }
+                /* Guard against CS ringbuffer wraparound overwrite if queue is backed up */
+                if (g.ringIoOutCpu[q] && g.ringSize[q] > sizeof(pkt) * 2u) {
+                    for (uint32_t w = 0u; w < 200u; ++w) {
+                        cacheFlushRange(g.ringIoOutCpu[q], 64);
+                        uint64_t ext = g.ringIoOutCpu[q]->extract;
+                        if (g.ringInsert[q] < ext || (g.ringInsert[q] - ext) <= (g.ringSize[q] - sizeof(pkt) * 2u)) break;
+                        IODelay(50);
+                    }
                 }
                 uint32_t ringOff = static_cast<uint32_t>(g.ringInsert[q] % g.ringSize[q]);
                 uint8_t *ringCpu = static_cast<uint8_t *>(g.ringDesc[q]->getBytesNoCopy());
@@ -2565,12 +2847,16 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
                 cacheFlushRange(ringCpu + ringOff, sizeof(pkt));
 
                 g.ringInsert[q] += sizeof(pkt);
-                g.ringIoInCpu[q]->insert = g.ringInsert[q];
-                cacheFlushRange(g.ringIoInCpu[q], 64);
-                anyWritten = true;
+                qDirtyMask |= (1u << q);
             }
-            if (anyWritten) {
-                /* Ring CSG doorbell ONCE after all subqueues in the batch are queued */
+            if (qDirtyMask) {
+                /* Publish updated ringInsert ONCE per active queue, then ring CSG doorbell ONCE */
+                for (uint32_t q = 0; q < g.queue_count && q < MALI_MAX_QUEUES_PER_GROUP; ++q) {
+                    if ((qDirtyMask & (1u << q)) && g.ringIoInCpu[q]) {
+                        g.ringIoInCpu[q]->insert = g.ringInsert[q];
+                        cacheFlushRange(g.ringIoInCpu[q], 64);
+                    }
+                }
                 wr32(gMali.maliReg.va, CSF_DOORBELL(dbId), 1u);
             }
         }
@@ -2584,7 +2870,7 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
             __atomic_store_n(&g.completed_seq, seq, __ATOMIC_RELEASE);
         }
         IOLockUnlock(fLock);
-        IOLockUnlock(gMali.schedLock);
+        if (lockedSched) IOLockUnlock(gMali.schedLock);
 
         auto *out = static_cast<Tb375fcMaliGroupSubmitOut *>(args->structureOutput);
         out->fence_seq = seq;
@@ -2608,13 +2894,16 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
             return kIOReturnSuccess;
         }
 
-        IOLockLock(gMali.schedLock);
+        const bool wsFastFence = fIsWindowServer && gMali.wsLock &&
+                                 (__atomic_load_n(&fGroups[in->group_handle].hw_slot, __ATOMIC_ACQUIRE) == 0);
+        IOLock *slotLock = wsFastFence ? gMali.wsLock : gMali.schedLock;
+        IOLockLock(slotLock);
         IOLockLock(fLock);
         MaliGroupEntry &g = fGroups[in->group_handle];
         uint64_t curComp = __atomic_load_n(&g.completed_seq, __ATOMIC_ACQUIRE);
         if (!g.in_use || curComp >= wantSeq || !g.hw_started || g.hw_slot < 0) {
             IOLockUnlock(fLock);
-            IOLockUnlock(gMali.schedLock);
+            IOLockUnlock(slotLock);
             out->signaled = 1u;
             out->current_seq = (curComp >= wantSeq) ? curComp : wantSeq;
             args->structureOutputSize = sizeof(*out);
@@ -2631,12 +2920,9 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
             ioOuts[qi]  = g.ringIoOutCpu[qi];
         }
         IOLockUnlock(fLock);
-        IOLockUnlock(gMali.schedLock);
+        IOLockUnlock(slotLock);
 
         bool done = false;
-        uint32_t maxMs = static_cast<uint32_t>(in->timeout_ns / 1000000ULL);
-        if (in->timeout_ns > 0 && maxMs == 0) maxMs = 1u;
-        if (maxMs > 5000u) maxMs = 5000u;
 
         auto isDone = [&]() -> bool {
             if (__atomic_load_n(&g.completed_seq, __ATOMIC_ACQUIRE) >= wantSeq) return true;
@@ -2665,18 +2951,41 @@ IOReturn Tb375fcMaliUserClient::externalMethod(uint32_t selector, IOExternalMeth
         if (in->timeout_ns == 0) {
             done = isDone();
         } else {
-            /* Brief 20us spin (up to min(timeout, 400us)) catches fast GPU fences without wasting
-             * 5ms of 100% CPU, then yields cleanly in 1ms IOSleep steps up to maxMs. */
-            uint32_t spinMax = (in->timeout_ns < 400000ULL)
-                ? static_cast<uint32_t>((in->timeout_ns + 19999ULL) / 20000ULL) : 20u;
+            uint64_t t0 = 0, tNow = 0, ns0 = 0, nsNow = 0;
+            clock_get_uptime(&t0);
+            absolutetime_to_nanoseconds(t0, &ns0);
+            uint64_t capNs = (in->timeout_ns > 5000000000ULL) ? 5000000000ULL : in->timeout_ns;
+            const uint64_t deadlineNs = ns0 + capNs;
+
+            /* Brief 150us spin for tiny submits, then non-coalesced 200us timer waits
+             * (0ms leeway, 0% CPU burn while GPU runs, <=0.2ms wakeup jitter). */
+            uint32_t spinMax = (capNs < 150000ULL)
+                ? static_cast<uint32_t>((capNs + 14999ULL) / 15000ULL) : 10u;
             for (uint32_t spin = 0; spin < spinMax; ++spin) {
                 if (isDone()) { done = true; break; }
-                IODelay(20);
+                IODelay(15);
             }
-            for (uint32_t ms = 1; !done && ms <= maxMs; ++ms) {
+            uint32_t sleeps = 0;
+            while (!done) {
                 if (isDone()) { done = true; break; }
-                IOSleep(1);
+                clock_get_uptime(&tNow);
+                absolutetime_to_nanoseconds(tNow, &nsNow);
+                if (nsNow >= deadlineNs) break;
+                if ((++sleeps % 100u) == 0u &&
+                    (rd32(gMali.maliReg.va, MMU_INT_RAWSTAT) & 0xFEu) != 0u) {
+                    checkAndRecoverMmuFaults("fence-wait");
+                    if (isDone()) { done = true; break; }
+                }
+                uint64_t remUs = (deadlineNs - nsNow) / 1000ULL;
+                uint32_t stepUs = (sleeps <= 50u) ? 200u : 500u;
+                if (remUs < stepUs) stepUs = (remUs > 50u) ? static_cast<uint32_t>(remUs) : 50u;
+                maliShortSleepUs(stepUs);
             }
+        }
+
+        if (!done && (rd32(gMali.maliReg.va, MMU_INT_RAWSTAT) & 0xFEu) != 0u) {
+            checkAndRecoverMmuFaults("fence-to");
+            if (isDone()) done = true;
         }
 
         if (done) {
@@ -2796,6 +3105,7 @@ static void maliDriverWorker(void *, wait_result_t) {
     IOLog("Tb375fcMali: driver worker starting (mali=4 multi-process IOUserClient)\n");
     gMali.lock      = IOLockAlloc();
     gMali.schedLock = IOLockAlloc();
+    gMali.wsLock    = IOLockAlloc();
     if (initMaliHardware()) {
         Tb375fcMali *svc = new Tb375fcMali;
         if (svc && svc->init()) {
@@ -2808,17 +3118,16 @@ static void maliDriverWorker(void *, wait_result_t) {
 }
 
 /* Snapshot WindowServer CSG0's current submitted_seq at validateSwap() time so kickOnce()
- * waits ONLY for Frame N (never stalling on Frame N+1 submitted early under triple-buffering). */
+ * waits ONLY for Frame N (never stalling on Frame N+1 submitted early under triple-buffering).
+ * Uses dedicated gMali.wsLock (never blocked by non-WS LRU evictions on gMali.schedLock). */
 extern "C" uint64_t tb375fc_mali_ws_submitted_seq(void);
 extern "C" uint64_t tb375fc_mali_ws_submitted_seq(void) {
-    if (!gMali.schedLock || !gMali.devInfo.mcu_alive) return 0ULL;
+    if (!gMali.wsLock || !gMali.devInfo.mcu_alive) return 0ULL;
     uint64_t seq = 0ULL;
-    IOLockLock(gMali.schedLock);
-    MaliHwSlot &slot = gMali.slots[0];
-    if (slot.ownerClient && slot.ownerClient->fIsWindowServer &&
-        slot.ownerClient->fLock && slot.ownerClient->fGroups) {
-        Tb375fcMaliUserClient *owner = slot.ownerClient;
-        uint32_t grpIdx = slot.ownerGroupIdx;
+    IOLockLock(gMali.wsLock);
+    Tb375fcMaliUserClient *owner = gMali.wsClient;
+    uint32_t grpIdx = gMali.wsGroupIdx;
+    if (owner && owner->fIsWindowServer && owner->fLock && owner->fGroups) {
         IOLockLock(owner->fLock);
         if (grpIdx > 0u && grpIdx < kMaxClientGroups &&
             owner->fGroups[grpIdx].in_use && owner->fGroups[grpIdx].hw_started) {
@@ -2826,17 +3135,15 @@ extern "C" uint64_t tb375fc_mali_ws_submitted_seq(void) {
         }
         IOLockUnlock(owner->fLock);
     }
-    IOLockUnlock(gMali.schedLock);
+    IOLockUnlock(gMali.wsLock);
     return seq;
 }
 
 /* Synchronize NativeLegacyDisplay CPU blit with WindowServer's pinned Mali-G615 CSG0 queue.
- * If wantSeq > 0, waits specifically for that swap's seq (from seqHist) instead of latest
- * submitted_seq (avoiding Frame N+1 stalls under triple buffering). Updates g.completed_seq
- * on completion so userspace MALI_SEL_FENCE_WAIT also sees completion immediately. */
+ * Uses dedicated gMali.wsLock (never blocked by non-WS LRU evictions on gMali.schedLock). */
 extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us);
 extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us) {
-    if (!gMali.schedLock || !gMali.devInfo.mcu_alive) return 0u;
+    if (!gMali.wsLock || !gMali.devInfo.mcu_alive) return 0u;
 
     Tb375fcMaliUserClient *owner = nullptr;
     uint32_t qCount = 0u;
@@ -2845,12 +3152,11 @@ extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us) 
     uint64_t targets[MALI_MAX_QUEUES_PER_GROUP] = {};
     FwRingIoOutput *ioOuts[MALI_MAX_QUEUES_PER_GROUP] = {};
 
-    IOLockLock(gMali.schedLock);
-    MaliHwSlot &slot = gMali.slots[0]; /* Slot 0 is permanently pinned to WindowServer */
-    if (slot.ownerClient && slot.ownerClient->fIsWindowServer &&
-        slot.ownerClient->fLock && slot.ownerClient->fGroups) {
-        owner = slot.ownerClient;
-        grpIdx = slot.ownerGroupIdx;
+    IOLockLock(gMali.wsLock);
+    if (gMali.wsClient && gMali.wsClient->fIsWindowServer &&
+        gMali.wsClient->fLock && gMali.wsClient->fGroups) {
+        owner = gMali.wsClient;
+        grpIdx = gMali.wsGroupIdx;
         owner->retain();
         IOLockLock(owner->fLock);
         if (grpIdx > 0u && grpIdx < kMaxClientGroups &&
@@ -2872,7 +3178,7 @@ extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us) 
         }
         IOLockUnlock(owner->fLock);
     }
-    IOLockUnlock(gMali.schedLock);
+    IOLockUnlock(gMali.wsLock);
 
     if (!owner) return 0u;
     if (qCount == 0u || targetSeq == 0ULL) {
@@ -2906,18 +3212,28 @@ extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us) 
     const uint64_t deadlineNs = ns0 + static_cast<uint64_t>(max_us) * 1000ULL;
 
     bool done = false;
-    /* Fine 25us spin for first 1.5ms avoids XNU IOSleep(1) ~1.2ms timer slack on fast frames */
-    uint32_t spinCap = (max_us < 1500u) ? ((max_us + 24u) / 25u) : 60u;
+    /* Brief 150us spin then non-coalesced 200us sleep: avoids 1.5ms P-core spin AND 1.5-4ms IOSleep slack */
+    uint32_t spinCap = (max_us < 150u) ? ((max_us + 14u) / 15u) : 10u;
     for (uint32_t s = 0u; s < spinCap; ++s) {
-        IODelay(25);
+        IODelay(15);
         if (allDone()) { done = true; break; }
     }
+    uint32_t sleeps = 0u;
     while (!done) {
         clock_get_uptime(&tNow);
         absolutetime_to_nanoseconds(tNow, &nsNow);
         if (nsNow >= deadlineNs) break;
-        IOSleep(1);
+        uint64_t remUs = (deadlineNs - nsNow) / 1000ULL;
+        uint32_t stepUs = (++sleeps <= 50u) ? 200u : 500u;
+        if (remUs < stepUs) stepUs = (remUs > 50u) ? static_cast<uint32_t>(remUs) : 50u;
+        maliShortSleepUs(stepUs);
         if (allDone()) { done = true; break; }
+    }
+
+    if (!done) {
+        if (checkAndRecoverMmuFaults("ws-sync") && allDone()) {
+            done = true;
+        }
     }
 
     if (done) {
@@ -2936,9 +3252,19 @@ extern "C" uint32_t tb375fc_mali_wait_ws_seq(uint64_t wantSeq, uint32_t max_us) 
     static uint32_t sSyncTimeouts = 0u;
     uint32_t n = ++sSyncWaits;
     if (!done) ++sSyncTimeouts;
-    if (n <= 20u || (n % 500u) == 0u || (!done && sSyncTimeouts <= 32u)) {
-        IOLog("Tb375fcMali: ws-display-sync #%u waited=%uus done=%u seq=%llu timeouts=%u\n",
-              n, waitedUs, (unsigned)done, (unsigned long long)targetSeq, sSyncTimeouts);
+    if (n <= 20u || (n % 500u) == 0u || (!done && (sSyncTimeouts <= 32u || (sSyncTimeouts % 32u) == 0u))) {
+        if (!done && gMali.maliReg.va) {
+            uint32_t mmuRaw = rd32(gMali.maliReg.va, MMU_INT_RAWSTAT);
+            uint32_t as1Flt = rd32(gMali.maliReg.va, AS_REG(1u, AS_FAULTSTATUS));
+            uint64_t as1Adr = static_cast<uint64_t>(rd32(gMali.maliReg.va, AS_REG(1u, AS_FAULTADDR_LO))) |
+                              (static_cast<uint64_t>(rd32(gMali.maliReg.va, AS_REG(1u, AS_FAULTADDR_HI))) << 32);
+            uint32_t shRdy  = rd32(gMali.maliReg.va, 0x0140u);
+            IOLog("Tb375fcMali: ws-display-sync #%u waited=%uus done=0 seq=%llu timeouts=%u mmu=0x%x as1=0x%x@0x%llx shRdy=0x%x\n",
+                  n, waitedUs, (unsigned long long)targetSeq, sSyncTimeouts, mmuRaw, as1Flt, (unsigned long long)as1Adr, shRdy);
+        } else {
+            IOLog("Tb375fcMali: ws-display-sync #%u waited=%uus done=%u seq=%llu timeouts=%u\n",
+                  n, waitedUs, (unsigned)done, (unsigned long long)targetSeq, sSyncTimeouts);
+        }
     }
     return waitedUs;
 }
